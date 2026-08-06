@@ -32,10 +32,12 @@
     "appId": "com.nimbus.aichat",
     "productName": "Nimbus",
     "files": ["electron.js", "package.json"],
+    "afterPack": "scripts/afterPack.js",
     "extraResources": [
       {
         "from": ".next/standalone",
-        "to": "standalone"
+        "to": "standalone",
+        "filter": ["**/*", "!node_modules"]
       },
       {
         "from": ".next/static",
