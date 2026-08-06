@@ -46,6 +46,10 @@
       {
         "from": "public",
         "to": "standalone/public"
+      },
+      {
+        "from": ".env.local",
+        "to": "standalone/.env.local"
       }
     ]
   }
