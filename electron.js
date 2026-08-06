@@ -33,7 +33,12 @@ function waitForServer(url, timeoutMs = 15000) {
 function startStandaloneServer() {
   const serverEntry = path.join(process.resourcesPath, "standalone", "server.js");
   serverProcess = spawn(process.execPath, [serverEntry], {
-    env: { ...process.env, PORT: String(PORT), NODE_ENV: "production" },
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: "1",
+      PORT: String(PORT),
+      NODE_ENV: "production",
+    },
     stdio: "inherit",
   });
   serverProcess.on("exit", (code) => {
