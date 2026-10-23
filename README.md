@@ -2,7 +2,7 @@
 
 A multi-model AI assistant that **does things**: it searches live job boards and the web, reads pages, and remembers your preferences, projects and decisions across conversations. Built with Next.js (App Router) and the OpenRouter API.
 
-**Live demo:** https://deep-seek-clone-wine.vercel.app
+**Live demo:** https://getnimbus.vercel.app/
 
 ## Features
 
