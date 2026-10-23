@@ -38,6 +38,9 @@ function startStandaloneServer() {
       ELECTRON_RUN_AS_NODE: "1",
       PORT: String(PORT),
       NODE_ENV: "production",
+      // Persistent memory must live in a writable per-user location, not in
+      // the (possibly read-only) install directory, and must survive updates.
+      NIMBUS_DATA_DIR: process.env.NIMBUS_DATA_DIR || path.join(app.getPath("userData"), "nimbus-data"),
     },
     stdio: "inherit",
   });

@@ -1,8 +1,9 @@
 // Single source of truth for selectable models.
 // `slug` is the public key the client sends; `upstream` is the OpenRouter
-// model id; `label` is what's shown in the UI. Add new models here only —
-// both the API route and the client read from this file, so there's no
-// risk of the two lists drifting apart.
+// model id; `label` is what's shown in the UI; `tools: false` marks models
+// whose OpenRouter route doesn't support tool calling (the server also
+// detects this at runtime and falls back to plain chat). Add new models here
+// only — both the API route and the client read from this file.
 
 export const MODELS = {
   "deepseek-v3.2": { label: "DeepSeek V3.2", upstream: "deepseek/deepseek-v3.2" },

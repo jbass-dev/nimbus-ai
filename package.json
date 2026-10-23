@@ -8,6 +8,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "node --test tests/*.test.mjs",
+    "eval": "node --env-file=.env.local scripts/eval-live.mjs",
+    "metrics": "node scripts/metrics-report.mjs",
     "electron": "electron .",
     "electron:dist": "next build && electron-builder"
   },

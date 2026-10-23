@@ -3,15 +3,16 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import Sidebar from "./components/Sidebar";
 import MessageBubble from "./components/MessageBubble";
+import MemoryPanel from "./components/MemoryPanel";
 import { MODELS, DEFAULT_MODEL } from "./config/models";
 
 const MAX_INPUT_LENGTH = 8000;
 
 const SUGGESTIONS = [
-  { icon: "💡", text: "Explain JavaScript closures with an example" },
+  { icon: "💼", text: "Find remote React jobs paying at least $60k" },
+  { icon: "🔎", text: "Research the latest Next.js release and what changed" },
+  { icon: "🧠", text: "Remember that I prefer remote jobs" },
   { icon: "⚛️", text: "Write a custom React hook for debouncing input" },
-  { icon: "✉️", text: "Draft a professional follow-up email after an interview" },
-  { icon: "🗺️", text: "Plan a 3-day weekend trip itinerary" },
 ];
 
 export default function Home() {
@@ -21,6 +22,7 @@ export default function Home() {
   const [text, setText] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [model, setModel] = useState(DEFAULT_MODEL);
+  const [showMemory, setShowMemory] = useState(false);
 
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
@@ -116,117 +118,163 @@ export default function Home() {
     return id;
   }, []);
 
+  const patchLastAssistant = useCallback(
+    (chatId, patch) => {
+      updateChatMessages(chatId, (messages) => {
+        const updated = [...messages];
+        const last = updated[updated.length - 1];
+        if (!last || last.role !== "assistant") return messages;
+        updated[updated.length - 1] = {
+          ...last,
+          ...(typeof patch === "function" ? patch(last) : patch),
+        };
+        return updated;
+      });
+    },
+    [updateChatMessages]
+  );
+
+  /* The server streams newline-delimited JSON events: tokens of the reply
+     plus what Nimbus actually did (tool calls, memories used, notices).
+     Tool activity shown in the UI comes from these events, so it reflects
+     real executions — not the model's description of them. */
+  const handleEvent = useCallback(
+    (chatId, event, acc) => {
+      switch (event.type) {
+        case "token":
+          acc.text += event.text;
+          patchLastAssistant(chatId, { content: acc.text });
+          break;
+        case "tool_start":
+          patchLastAssistant(chatId, (m) => ({
+            activity: [
+              ...(m.activity ?? []),
+              { id: event.id, name: event.name, args: event.args, status: "running" },
+            ],
+          }));
+          break;
+        case "tool_end":
+          patchLastAssistant(chatId, (m) => {
+            const activity = [...(m.activity ?? [])];
+            const i = activity.findIndex((a) => a.id === event.id);
+            const entry = {
+              id: event.id,
+              name: event.name,
+              status: event.ok ? "done" : "failed",
+              summary: event.summary,
+              ms: event.ms,
+            };
+            if (i >= 0) activity[i] = { ...activity[i], ...entry };
+            else activity.push(entry);
+            return { activity };
+          });
+          break;
+        case "memory":
+          patchLastAssistant(chatId, { memoryUsed: event.used });
+          break;
+        case "notice":
+          patchLastAssistant(chatId, (m) => ({ notices: [...(m.notices ?? []), event.text] }));
+          break;
+        case "confirm":
+          patchLastAssistant(chatId, { confirm: { actionId: event.actionId, prompt: event.prompt } });
+          break;
+        case "error":
+          acc.error = event.message;
+          break;
+        default:
+          break;
+      }
+    },
+    [patchLastAssistant]
+  );
+
   const streamCompletion = useCallback(
-    async (chatId, history) => {
+    async (chatId, history, { confirmedActions = [] } = {}) => {
       setIsStreaming(true);
 
       const controller = new AbortController();
       abortRef.current = controller;
 
-      updateChatMessages(chatId, [
-        ...history,
-        {
-          role: "assistant",
-          content: "",
-        },
-      ]);
+      updateChatMessages(chatId, [...history, { role: "assistant", content: "" }]);
+
+      const acc = { text: "", error: null };
 
       try {
         const response = await fetch("/api/OpenRouter", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            messages: history,
+            // Only role + content go upstream; UI-only fields stay local.
+            messages: history.map(({ role, content }) => ({ role, content })),
             model,
+            confirmedActions,
           }),
           signal: controller.signal,
         });
 
         if (!response.ok || !response.body) {
           let serverMessage = null;
-
           try {
             const body = await response.json();
             serverMessage = body?.error;
           } catch {
             // Response wasn't JSON
           }
-
-          throw new Error(
-            serverMessage || `HTTP error: ${response.status}`
-          );
+          throw new Error(serverMessage || `HTTP error: ${response.status}`);
         }
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-
-        let aiContent = "";
+        let buffer = "";
 
         while (true) {
           const { value, done } = await reader.read();
-
           if (done) break;
-
-          aiContent += decoder.decode(value, {
-            stream: true,
-          });
-
-          updateChatMessages(chatId, (messages) => {
-            const updated = [...messages];
-
-            updated[updated.length - 1] = {
-              ...updated[updated.length - 1],
-              content: aiContent,
-            };
-
-            return updated;
-          });
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              handleEvent(chatId, JSON.parse(line), acc);
+            } catch {
+              // ignore a malformed event line
+            }
+          }
+        }
+        if (buffer.trim()) {
+          try {
+            handleEvent(chatId, JSON.parse(buffer), acc);
+          } catch {
+            // ignore
+          }
         }
 
-        if (!aiContent) {
-          updateChatMessages(chatId, (messages) => {
-            const updated = [...messages];
-
-            updated[updated.length - 1] = {
-              ...updated[updated.length - 1],
-              content:
-                "I didn't get a response — please try again.",
-            };
-
-            return updated;
+        if (acc.error) {
+          patchLastAssistant(chatId, {
+            content: acc.text ? `${acc.text}\n\n> ⚠️ ${acc.error}` : acc.error,
+            isError: true,
           });
+        } else if (!acc.text) {
+          patchLastAssistant(chatId, { content: "I didn't get a response — please try again." });
         }
       } catch (error) {
         if (error?.name === "AbortError") {
           updateChatMessages(chatId, (messages) => {
             const updated = [...messages];
             const last = updated[updated.length - 1];
-
-            if (
-              last?.role === "assistant" &&
-              last.content === ""
-            ) {
+            if (last?.role === "assistant" && last.content === "" && !last.activity?.length) {
               updated.pop();
             }
-
             return updated;
           });
         } else {
           console.error("stream error:", error);
-
-          updateChatMessages(chatId, (messages) => {
-            const updated = [...messages];
-
-            updated[updated.length - 1] = {
-              role: "assistant",
-              content: error.message?.startsWith("HTTP error")
-                ? "Something went wrong. Please try again."
-                : error.message,
-            };
-
-            return updated;
+          patchLastAssistant(chatId, {
+            content: error.message?.startsWith("HTTP error")
+              ? "Something went wrong. Please try again."
+              : error.message,
+            isError: true,
           });
         }
       } finally {
@@ -234,7 +282,7 @@ export default function Home() {
         setIsStreaming(false);
       }
     },
-    [model, updateChatMessages]
+    [model, updateChatMessages, patchLastAssistant, handleEvent]
   );
 
   const sendMessage = useCallback(
@@ -323,6 +371,19 @@ export default function Home() {
     streamCompletion(activeChat.id, messages);
   }, [activeChat, isStreaming, streamCompletion]);
 
+  const confirmAction = useCallback(
+    (actionId) => {
+      if (!activeChat || isStreaming) return;
+      const messages = activeChat.messages.map((m, i) =>
+        i === activeChat.messages.length - 1 ? { ...m, confirm: { ...m.confirm, resolved: true } } : m
+      );
+      const history = [...messages, { role: "user", content: "Yes, I confirm. Go ahead." }];
+      updateChatMessages(activeChat.id, history);
+      streamCompletion(activeChat.id, history, { confirmedActions: [actionId] });
+    },
+    [activeChat, isStreaming, updateChatMessages, streamCompletion]
+  );
+
   const stopGeneration = useCallback(() => {
     abortRef.current?.abort();
   }, []);
@@ -365,6 +426,7 @@ export default function Home() {
           }
         }}
         onNewChat={() => createChat()}
+        onOpenMemory={() => setShowMemory(true)}
         onDeleteChat={(id) => {
           setChatSessions((prev) =>
             prev.filter((chat) => chat.id !== id)
@@ -407,6 +469,15 @@ export default function Home() {
             </div>
           </div>
 
+          <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowMemory(true)}
+            className="px-3 py-1.5 rounded-lg border border-neutral-700 text-sm text-neutral-300 hover:text-white hover:border-indigo-500 transition-colors"
+            title="See and manage what Nimbus remembers about you"
+          >
+            🧠 Memory
+          </button>
           <select
             value={model}
             onChange={(event) => setModel(event.target.value)}
@@ -420,7 +491,10 @@ export default function Home() {
               )
             )}
           </select>
+          </div>
         </header>
+
+        {showMemory && <MemoryPanel onClose={() => setShowMemory(false)} />}
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-4 py-6 scrollbar-thin">
@@ -439,7 +513,7 @@ export default function Home() {
                 <span className="text-neutral-200">
                   {MODELS[model]?.label}
                 </span>{" "}
-                — switch models any time, mid-conversation.
+                — it can search live jobs and the web, and remember your preferences.
               </p>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
@@ -473,6 +547,7 @@ export default function Home() {
                     index === activeChat.messages.length - 1
                   }
                   onRegenerate={regenerate}
+                  onConfirm={confirmAction}
                 />
               ))}
 
@@ -520,8 +595,8 @@ export default function Home() {
             </div>
 
             <p className="text-[11px] text-neutral-600 text-center mt-2">
-              Nimbus can make mistakes. Built with Next.js —
-              live token streaming via OpenRouter.
+              Nimbus can make mistakes — check links before acting.
+              Tool activity shown above each reply is what actually ran.
             </p>
           </div>
         </div>

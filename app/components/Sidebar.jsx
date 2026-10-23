@@ -10,6 +10,7 @@ const Sidebar = ({
   activeChatId,
   onSelectChat,
   onDeleteChat,
+  onOpenMemory,
 }) => {
   const [search, setSearch] = useState("");
 
@@ -116,9 +117,17 @@ const Sidebar = ({
 
       {/* BOTTOM */}
       {expand && (
-        <p className="text-[11px] text-neutral-600 px-1 pb-2">
-          Conversations are stored locally in your browser.
-        </p>
+        <div className="px-1 pb-2 space-y-2">
+          <button
+            onClick={onOpenMemory}
+            className="w-full text-left text-sm text-neutral-300 hover:text-white px-2.5 py-2 rounded-lg hover:bg-white/5 transition-colors"
+          >
+            🧠 Manage memory
+          </button>
+          <p className="text-[11px] text-neutral-600">
+            Chats are stored in this browser. Memory (preferences, projects, decisions) is saved by Nimbus across chats — you can view or delete it any time.
+          </p>
+        </div>
       )}
     </div>
   );
