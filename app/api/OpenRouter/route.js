@@ -3,6 +3,7 @@ import { runAgent } from "@/lib/nimbus/agent.mjs";
 import { createOpenRouterClient } from "@/lib/nimbus/llm.mjs";
 import { resolveIdentity } from "@/lib/nimbus/identity.mjs";
 import { getStore, logMetrics } from "@/lib/nimbus/server.mjs";
+import { normalizePermissions } from "@/lib/nimbus/permissions.mjs";
 
 // fs-backed memory + DNS checks need the Node runtime.
 export const runtime = "nodejs";
@@ -12,6 +13,32 @@ export const maxDuration = 120;
 const MAX_MESSAGES = 60; // caps how much history gets forwarded upstream
 const MAX_MESSAGE_LENGTH = 8000; // chars, per message
 const MAX_TOTAL_LENGTH = 60000; // chars, across the whole conversation
+
+// Past chats sent for search_chats (only when that permission is granted).
+const ARCHIVE_MAX_CHATS = 60;
+const ARCHIVE_MAX_MESSAGES = 40; // per chat
+const ARCHIVE_MAX_MESSAGE = 1500; // chars
+const ARCHIVE_MAX_TOTAL = 300_000; // chars across the archive
+
+function sanitizeArchive(archive) {
+  if (!Array.isArray(archive)) return null;
+  const out = [];
+  let total = 0;
+  for (const chat of archive.slice(0, ARCHIVE_MAX_CHATS)) {
+    if (!chat || typeof chat.id !== "string") continue;
+    const messages = [];
+    for (const m of Array.isArray(chat.messages) ? chat.messages.slice(-ARCHIVE_MAX_MESSAGES) : []) {
+      if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.content !== "string" || !m.content.trim()) continue;
+      const content = m.content.slice(0, ARCHIVE_MAX_MESSAGE);
+      if (total + content.length > ARCHIVE_MAX_TOTAL) break;
+      total += content.length;
+      messages.push({ role: m.role, content });
+    }
+    out.push({ id: chat.id.slice(0, 64), title: String(chat.title ?? "").slice(0, 200), messages });
+    if (total >= ARCHIVE_MAX_TOTAL) break;
+  }
+  return out;
+}
 
 // --- Rate limiting ---------------------------------------------------------
 // Simple in-memory sliding-window limiter, keyed by client IP. Process-local:
@@ -60,7 +87,7 @@ function validateMessages(messages) {
 
 /**
  * Streams newline-delimited JSON events:
- *   {type:"intent"|"memory"|"tool_start"|"tool_end"|"confirm"|"notice"|"token"|"done"|"error", ...}
+ *   {type:"intent"|"memory"|"tool_start"|"tool_end"|"confirm"|"permission"|"notice"|"token"|"done"|"error", ...}
  */
 export async function POST(req) {
   const { userKey, setCookie } = resolveIdentity(req);
@@ -79,7 +106,7 @@ export async function POST(req) {
     } catch {
       return jsonError("Request body must be JSON.", 400, setCookie);
     }
-    const { messages, model, confirmedActions } = body ?? {};
+    const { messages, model, confirmedActions, permissions, chatArchive } = body ?? {};
     const validationError = validateMessages(messages);
     if (validationError) return jsonError(validationError, 400, setCookie);
 
@@ -116,6 +143,9 @@ export async function POST(req) {
             supportsTools,
             env: { BRAVE_API_KEY: process.env.BRAVE_API_KEY, TAVILY_API_KEY: process.env.TAVILY_API_KEY },
             confirmedActions: Array.isArray(confirmedActions) ? confirmedActions.filter((a) => typeof a === "string").slice(0, 5) : [],
+            // Ask-every-time is the default: a missing permissions object means nothing is pre-allowed.
+            permissions: normalizePermissions(permissions) ?? normalizePermissions({}),
+            chatArchive: sanitizeArchive(chatArchive),
           });
           logMetrics({ model: modelSlug ?? "default", ...metrics });
         } catch (err) {

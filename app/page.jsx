@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import Sidebar from "./components/Sidebar";
 import MessageBubble from "./components/MessageBubble";
+import PermissionsPanel from "./components/PermissionsPanel";
 import MemoryPanel from "./components/MemoryPanel";
 import { MODELS, DEFAULT_MODEL } from "./config/models";
 
@@ -26,17 +27,32 @@ export default function Home() {
   // True once saved state has been read, so the save effects can't
   // overwrite storage with the empty initial state on first render.
   const [loaded, setLoaded] = useState(false);
+  // Search permission groups the user chose "Always allow" for; everything else asks first.
+  const [alwaysAllow, setAlwaysAllow] = useState([]);
+  const [showPermissions, setShowPermissions] = useState(false);
 
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
   const abortRef = useRef(null);
   const activeChatIdRef = useRef(activeChatId);
+  const alwaysAllowRef = useRef(alwaysAllow);
+  const chatSessionsRef = useRef(chatSessions);
+
+  useEffect(() => {
+    alwaysAllowRef.current = alwaysAllow;
+  }, [alwaysAllow]);
+
+  useEffect(() => {
+    chatSessionsRef.current = chatSessions;
+  }, [chatSessions]);
 
   useEffect(() => {
     activeChatIdRef.current = activeChatId;
   }, [activeChatId]);
 
-  // Load saved state
+  // Load saved state. Reading localStorage after mount (not during render)
+  // avoids a server/client hydration mismatch, so state is set here.
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     try {
       const saved = localStorage.getItem("chatSessions");
@@ -59,11 +75,15 @@ export default function Home() {
       if (savedModel && MODELS[savedModel]) {
         setModel(savedModel);
       }
+
+      const savedPerms = JSON.parse(localStorage.getItem("searchPermissions") ?? "[]");
+      if (Array.isArray(savedPerms)) setAlwaysAllow(savedPerms.filter((g) => typeof g === "string"));
     } catch {
       // Corrupted storage — start fresh
     }
     setLoaded(true);
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Persist chats
   useEffect(() => {
@@ -85,6 +105,11 @@ export default function Home() {
     if (!loaded) return;
     localStorage.setItem("model", model);
   }, [model, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    localStorage.setItem("searchPermissions", JSON.stringify(alwaysAllow));
+  }, [alwaysAllow, loaded]);
 
   // Auto-scroll
   useEffect(() => {
@@ -195,6 +220,9 @@ export default function Home() {
         case "notice":
           patchLastAssistant(chatId, (m) => ({ notices: [...(m.notices ?? []), event.text] }));
           break;
+        case "permission":
+          patchLastAssistant(chatId, { permission: { requests: event.requests ?? [] } });
+          break;
         case "confirm":
           patchLastAssistant(chatId, { confirm: { actionId: event.actionId, prompt: event.prompt } });
           break;
@@ -208,8 +236,26 @@ export default function Home() {
     [patchLastAssistant]
   );
 
+  /* Compact copy of the user's OTHER chats for search_chats (newest first). */
+  const buildChatArchive = useCallback(
+    (excludeId) =>
+      chatSessionsRef.current
+        .filter((chat) => chat.id !== excludeId && chat.messages?.length)
+        .slice(-60)
+        .reverse()
+        .map((chat) => ({
+          id: chat.id,
+          title: chat.title,
+          messages: chat.messages
+            .filter((m) => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
+            .slice(-40)
+            .map((m) => ({ role: m.role, content: m.content.slice(0, 1500) })),
+        })),
+    []
+  );
+
   const streamCompletion = useCallback(
-    async (chatId, history, { confirmedActions = [] } = {}) => {
+    async (chatId, history, { confirmedActions = [], allowOnce = [], always } = {}) => {
       setIsStreaming(true);
 
       const controller = new AbortController();
@@ -218,6 +264,8 @@ export default function Home() {
       updateChatMessages(chatId, [...history, { role: "assistant", content: "" }]);
 
       const acc = { text: "", error: null };
+      const alwaysList = always ?? alwaysAllowRef.current;
+      const chatsAllowed = alwaysList.includes("chats") || allowOnce.includes("chats");
 
       try {
         const response = await fetch("/api/OpenRouter", {
@@ -228,6 +276,9 @@ export default function Home() {
             messages: history.map(({ role, content }) => ({ role, content })),
             model,
             confirmedActions,
+            permissions: { always: alwaysList, once: allowOnce },
+            // Other chats are only sent when past-chat search is allowed for this reply.
+            ...(chatsAllowed ? { chatArchive: buildChatArchive(chatId) } : {}),
           }),
           signal: controller.signal,
         });
@@ -302,7 +353,7 @@ export default function Home() {
         setIsStreaming(false);
       }
     },
-    [model, updateChatMessages, patchLastAssistant, handleEvent]
+    [model, updateChatMessages, patchLastAssistant, handleEvent, buildChatArchive]
   );
 
   const sendMessage = useCallback(
@@ -409,6 +460,38 @@ export default function Home() {
     [activeChat, isStreaming, updateChatMessages, streamCompletion]
   );
 
+  /* Answer a permission prompt. Allowing re-runs the same request with the
+     permission granted; the waiting reply is replaced by the real answer. */
+  const respondToPermission = useCallback(
+    (choice) => {
+      if (!activeChat || isStreaming) return;
+      const last = activeChat.messages[activeChat.messages.length - 1];
+      if (last?.role !== "assistant" || !last.permission) return;
+
+      if (choice === "deny") {
+        patchLastAssistant(activeChat.id, {
+          permission: { ...last.permission, resolved: true },
+          content: "Okay, I won't run that search. Ask again anytime, or change this under 🔐 Permissions.",
+        });
+        return;
+      }
+
+      const groups = [...new Set(last.permission.requests.map((r) => r.group))];
+      let always = alwaysAllowRef.current;
+      if (choice === "always") {
+        always = [...new Set([...always, ...groups])];
+        setAlwaysAllow(always);
+        alwaysAllowRef.current = always;
+      }
+      const history = activeChat.messages.slice(0, -1);
+      streamCompletion(activeChat.id, history, {
+        allowOnce: choice === "once" ? groups : [],
+        always,
+      });
+    },
+    [activeChat, isStreaming, patchLastAssistant, streamCompletion]
+  );
+
   const stopGeneration = useCallback(() => {
     abortRef.current?.abort();
   }, []);
@@ -503,6 +586,14 @@ export default function Home() {
           >
             🧠 Memory
           </button>
+          <button
+            type="button"
+            onClick={() => setShowPermissions(true)}
+            className="px-3 py-1.5 rounded-lg border border-neutral-700 text-sm text-neutral-300 hover:text-white hover:border-indigo-500 transition-colors"
+            title="Choose which searches Nimbus may run without asking"
+          >
+            🔐 Permissions
+          </button>
           <select
             value={model}
             onChange={(event) => setModel(event.target.value)}
@@ -520,6 +611,13 @@ export default function Home() {
         </header>
 
         {showMemory && <MemoryPanel onClose={() => setShowMemory(false)} />}
+        {showPermissions && (
+          <PermissionsPanel
+            alwaysAllow={alwaysAllow}
+            onChange={setAlwaysAllow}
+            onClose={() => setShowPermissions(false)}
+          />
+        )}
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-4 py-6 scrollbar-thin">
@@ -573,6 +671,7 @@ export default function Home() {
                   }
                   onRegenerate={regenerate}
                   onConfirm={confirmAction}
+                  onPermission={respondToPermission}
                 />
               ))}
 

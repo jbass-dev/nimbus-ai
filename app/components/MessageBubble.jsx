@@ -82,6 +82,7 @@ export default function MessageBubble({
   onRegenerate,
   canRegenerate,
   onConfirm,
+  onPermission,
 }) {
   const isUser = message.role === "user";
   const hasActivity = !isUser && message.activity?.length > 0;
@@ -133,6 +134,40 @@ export default function MessageBubble({
             >
               Confirm
             </button>
+          </div>
+        )}
+
+        {!isUser && message.permission && !message.permission.resolved && !isStreaming && (
+          <div className="mt-2 w-full rounded-xl border border-sky-500/40 bg-sky-500/10 px-3 py-2 text-xs text-sky-100">
+            <p className="mb-1.5 font-medium">Nimbus wants to:</p>
+            <ul className="mb-2 list-disc space-y-0.5 pl-4">
+              {message.permission.requests.map((r) => (
+                <li key={`${r.group}:${r.description}`}>{r.description}</li>
+              ))}
+            </ul>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => onPermission?.("once")}
+                className="rounded-md bg-sky-500/80 px-2.5 py-1 font-medium text-neutral-950 hover:bg-sky-400"
+              >
+                Allow once
+              </button>
+              <button
+                type="button"
+                onClick={() => onPermission?.("always")}
+                className="rounded-md border border-sky-400/60 px-2.5 py-1 font-medium hover:bg-sky-500/20"
+              >
+                Always allow
+              </button>
+              <button
+                type="button"
+                onClick={() => onPermission?.("deny")}
+                className="rounded-md px-2.5 py-1 text-neutral-300 hover:bg-white/10 hover:text-white"
+              >
+                Deny
+              </button>
+            </div>
           </div>
         )}
 
