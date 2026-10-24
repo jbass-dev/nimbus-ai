@@ -23,6 +23,9 @@ export default function Home() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [showMemory, setShowMemory] = useState(false);
+  // True once saved state has been read, so the save effects can't
+  // overwrite storage with the empty initial state on first render.
+  const [loaded, setLoaded] = useState(false);
 
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
@@ -40,31 +43,48 @@ export default function Home() {
       const savedActive = localStorage.getItem("activeChatId");
       const savedModel = localStorage.getItem("model");
 
-      if (saved) setChatSessions(JSON.parse(saved));
-      if (savedActive) setActiveChatId(savedActive);
+      const sessions = saved ? JSON.parse(saved) : [];
+      if (Array.isArray(sessions)) setChatSessions(sessions);
+
+      // Only resume the saved chat if it still exists. A stale id (e.g. the
+      // chat was deleted) made the first message on launch go nowhere.
+      if (
+        savedActive &&
+        Array.isArray(sessions) &&
+        sessions.some((chat) => chat.id === savedActive)
+      ) {
+        setActiveChatId(savedActive);
+      }
+
       if (savedModel && MODELS[savedModel]) {
         setModel(savedModel);
       }
     } catch {
       // Corrupted storage — start fresh
     }
+    setLoaded(true);
   }, []);
 
   // Persist chats
   useEffect(() => {
+    if (!loaded) return;
     localStorage.setItem("chatSessions", JSON.stringify(chatSessions));
-  }, [chatSessions]);
+  }, [chatSessions, loaded]);
 
   useEffect(() => {
+    if (!loaded) return;
     if (activeChatId) {
       localStorage.setItem("activeChatId", activeChatId);
+    } else {
+      localStorage.removeItem("activeChatId");
     }
-  }, [activeChatId]);
+  }, [activeChatId, loaded]);
 
   // Persist model
   useEffect(() => {
+    if (!loaded) return;
     localStorage.setItem("model", model);
-  }, [model]);
+  }, [model, loaded]);
 
   // Auto-scroll
   useEffect(() => {
@@ -301,7 +321,12 @@ export default function Home() {
       let chatId = activeChatIdRef.current;
       let history;
 
-      if (!chatId) {
+      // Start a chat automatically when none is open (first launch, or the
+      // open chat was deleted) instead of requiring "New Chat" first.
+      const chatExists =
+        chatId && chatSessions.some((chat) => chat.id === chatId);
+
+      if (!chatExists) {
         chatId = createChat();
 
         history = [
@@ -562,6 +587,7 @@ export default function Home() {
             <div className="flex items-end gap-2 bg-neutral-900 border border-neutral-700 rounded-2xl p-2 focus-within:border-indigo-500 transition-colors">
               <textarea
                 ref={textareaRef}
+                autoFocus
                 rows={1}
                 className="flex-1 select-text bg-transparent text-sm px-2 py-2 resize-none outline-none max-h-40 placeholder:text-neutral-500"
                 placeholder="Ask anything…"
