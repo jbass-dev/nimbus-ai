@@ -28,7 +28,7 @@ export default function PermissionsPanel({ alwaysAllow, onChange, onClose }) {
         <div className="flex items-center justify-between border-b border-neutral-800 px-5 py-3">
           <div>
             <h2 className="text-base font-semibold">Search permissions</h2>
-            <p className="text-xs text-neutral-500">Nimbus asks before every search unless you allow it here.</p>
+            <p className="text-xs text-neutral-500">Choose which lookups run automatically and which ask you first.</p>
           </div>
           <button type="button" onClick={onClose} className="h-8 w-8 rounded-lg text-neutral-400 hover:bg-white/10 hover:text-white" aria-label="Close">
             ✕

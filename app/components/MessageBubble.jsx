@@ -1,6 +1,8 @@
 "use client";
 
+import { useState } from "react";
 import Markdown, { CopyButton } from "./Markdown";
+import AttachmentChips from "./AttachmentChips";
 
 function Avatar({ role }) {
   if (role === "user") {
@@ -27,6 +29,8 @@ const TOOL_LABELS = {
   update_memory: "Updated memory",
   forget_memory: "Forgot",
   forget_all_memories: "Clear all memory",
+  get_weather: "Weather",
+  search_chats: "Searched past chats",
 };
 
 function describeArgs(name, args) {
@@ -39,6 +43,7 @@ function describeArgs(name, args) {
     return bits.filter(Boolean).join(" · ");
   }
   if (name === "web_search") return args.query;
+  if (name === "get_weather") return args.location;
   if (name === "fetch_url") {
     try {
       return new URL(args.url).host;
@@ -83,8 +88,23 @@ export default function MessageBubble({
   canRegenerate,
   onConfirm,
   onPermission,
+  onEdit,
+  canEdit,
 }) {
   const isUser = message.role === "user";
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+
+  const startEdit = () => {
+    setDraft(message.content);
+    setEditing(true);
+  };
+  const submitEdit = () => {
+    const text = draft.trim();
+    if (!text) return;
+    setEditing(false);
+    if (text !== message.content) onEdit?.(text);
+  };
   const hasActivity = !isUser && message.activity?.length > 0;
 
   return (
@@ -100,6 +120,45 @@ export default function MessageBubble({
           isUser ? "items-end" : "items-start"
         }`}
       >
+        {isUser && message.attachments?.length > 0 && (
+          <AttachmentChips attachments={message.attachments} className="mb-1.5 justify-end" />
+        )}
+
+        {isUser && editing ? (
+          <div className="w-full min-w-[260px] md:min-w-[420px] rounded-2xl border border-indigo-500/60 bg-neutral-900 p-2">
+            <textarea
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  submitEdit();
+                }
+                if (e.key === "Escape") setEditing(false);
+              }}
+              rows={Math.min(8, Math.max(2, draft.split("\n").length))}
+              className="w-full resize-none bg-transparent px-2 py-1 text-sm text-white outline-none"
+            />
+            <div className="mt-1 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEditing(false)}
+                className="rounded-md px-2.5 py-1 text-xs text-neutral-300 hover:bg-white/10 hover:text-white"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={submitEdit}
+                disabled={!draft.trim()}
+                className="rounded-md bg-indigo-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-indigo-500 disabled:opacity-40"
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        ) : isUser && !message.content ? null : (
         <div
           className={`select-text px-4 py-2.5 rounded-2xl text-sm ${
             isUser
@@ -123,6 +182,22 @@ export default function MessageBubble({
             </span>
           )}
         </div>
+        )}
+
+        {isUser && !editing && (
+          <div className="flex gap-1 mt-1 opacity-0 hover:opacity-100 focus-within:opacity-100 transition-opacity">
+            <CopyButton text={message.content} />
+            {canEdit && (
+              <button
+                type="button"
+                onClick={startEdit}
+                className="text-xs px-2 py-1 rounded-md text-neutral-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+              >
+                Edit
+              </button>
+            )}
+          </div>
+        )}
 
         {!isUser && message.confirm && !message.confirm.resolved && !isStreaming && (
           <div className="mt-2 flex items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">

@@ -1,6 +1,20 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
+import { highlight } from "@/lib/ui/highlight.mjs";
+
+// GitHub-dark-style colors for highlighted tokens.
+const TOKEN_CLASS = {
+  keyword: "text-[#ff7b72]",
+  string: "text-[#a5d6ff]",
+  comment: "text-[#8b949e] italic",
+  number: "text-[#79c0ff]",
+  function: "text-[#d2a8ff]",
+  type: "text-[#ffa657]",
+  tag: "text-[#7ee787]",
+  attr: "text-[#79c0ff]",
+  punct: "text-[#8b949e]",
+};
 
 /* ── Copy button ───────────────────────────────────────── */
 
@@ -38,6 +52,7 @@ function CopyButton({ text, className = "" }) {
 /* ── Code block ─────────────────────────────────────────── */
 
 function CodeBlock({ lang, code }) {
+  const tokens = useMemo(() => highlight(code, lang), [code, lang]);
   return (
     <div className="my-3 rounded-xl overflow-hidden border border-neutral-700/60 bg-[#0d1117]">
       <div className="flex items-center justify-between px-4 py-1.5 bg-white/5 border-b border-neutral-700/60">
@@ -50,7 +65,15 @@ function CodeBlock({ lang, code }) {
 
       <pre className="select-text p-4 overflow-x-auto text-[13px] leading-relaxed">
         <code className="select-text font-mono text-[#e6edf3]">
-          {code}
+          {tokens.map((t, i) =>
+            t.type === "plain" ? (
+              t.text
+            ) : (
+              <span key={i} className={TOKEN_CLASS[t.type]}>
+                {t.text}
+              </span>
+            )
+          )}
         </code>
       </pre>
     </div>

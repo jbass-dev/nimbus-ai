@@ -11,12 +11,23 @@ const Sidebar = ({
   onSelectChat,
   onDeleteChat,
   onOpenMemory,
+  onRenameChat,
+  onTogglePin,
 }) => {
   const [search, setSearch] = useState("");
+  const [renaming, setRenaming] = useState(null); // { id, title }
 
-  const filteredChats = chatSessions.filter((chat) =>
-    chat.title.toLowerCase().includes(search.toLowerCase())
-  );
+  // Pinned first, then newest first (chats are appended as they're created).
+  const filteredChats = chatSessions
+    .map((chat, order) => ({ chat, order }))
+    .filter(({ chat }) => (chat.title ?? "").toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => Number(!!b.chat.pinned) - Number(!!a.chat.pinned) || b.order - a.order)
+    .map(({ chat }) => chat);
+
+  const finishRename = () => {
+    if (renaming?.title.trim()) onRenameChat?.(renaming.id, renaming.title.trim().slice(0, 80));
+    setRenaming(null);
+  };
 
   return (
     <div
@@ -90,24 +101,69 @@ const Sidebar = ({
               {filteredChats.map((chat) => (
                 <div
                   key={chat.id}
-                  onClick={() => onSelectChat(chat.id)}
+                  onClick={() => renaming?.id !== chat.id && onSelectChat(chat.id)}
+                  onDoubleClick={() => setRenaming({ id: chat.id, title: chat.title || "" })}
                   className={`group flex items-center justify-between px-2.5 py-2 rounded-lg cursor-pointer transition-colors text-sm ${
                     chat.id === activeChatId
                       ? "bg-indigo-600/20 text-white border border-indigo-500/40"
                       : "text-neutral-300 hover:bg-white/5 border border-transparent"
                   }`}
                 >
-                  <span className="flex-1 truncate">{chat.title || "New Chat"}</span>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDeleteChat(chat.id);
-                    }}
-                    className="ml-2 text-neutral-600 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-red-400 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400 rounded"
-                    aria-label="Delete chat"
-                  >
-                    ✕
-                  </button>
+                  {renaming?.id === chat.id ? (
+                    <input
+                      autoFocus
+                      value={renaming.title}
+                      onChange={(e) => setRenaming({ ...renaming, title: e.target.value })}
+                      onClick={(e) => e.stopPropagation()}
+                      onBlur={finishRename}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") finishRename();
+                        if (e.key === "Escape") setRenaming(null);
+                      }}
+                      className="flex-1 min-w-0 bg-neutral-800 text-white rounded px-1.5 py-0.5 outline-none border border-indigo-500"
+                      aria-label="Chat name"
+                    />
+                  ) : (
+                    <span className="flex-1 truncate">
+                      {chat.pinned && <span className="mr-1" aria-label="Pinned">📌</span>}
+                      {chat.title || "New Chat"}
+                    </span>
+                  )}
+                  <div className="ml-1 flex shrink-0 items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onTogglePin?.(chat.id);
+                      }}
+                      className="h-6 w-6 rounded text-[13px] text-neutral-500 hover:text-white hover:bg-white/10"
+                      aria-label={chat.pinned ? "Unpin chat" : "Pin chat"}
+                      title={chat.pinned ? "Unpin" : "Pin"}
+                    >
+                      {chat.pinned ? "★" : "☆"}
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRenaming({ id: chat.id, title: chat.title || "" });
+                      }}
+                      className="h-6 w-6 rounded text-[12px] text-neutral-500 hover:text-white hover:bg-white/10"
+                      aria-label="Rename chat"
+                      title="Rename"
+                    >
+                      ✎
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDeleteChat(chat.id);
+                      }}
+                      className="h-6 w-6 rounded text-neutral-500 hover:text-red-400 hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400"
+                      aria-label="Delete chat"
+                      title="Delete"
+                    >
+                      ✕
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>

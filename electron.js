@@ -1,10 +1,48 @@
-const { app, BrowserWindow, Menu, shell, clipboard } = require("electron");
+const { app, BrowserWindow, Menu, shell, clipboard, dialog } = require("electron");
 const path = require("path");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 const http = require("http");
+const net = require("net");
 
-const PORT = process.env.NIMBUS_PORT || 3000;
+// Fixed port on purpose: chats, settings and the memory cookie are stored per
+// origin (http://localhost:3000), so changing the port would hide them.
+const PORT = Number(process.env.NIMBUS_PORT) || 3000;
 let serverProcess = null;
+
+function isPortFree(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once("error", () => resolve(false));
+    srv.listen(port, () => srv.close(() => resolve(true)));
+  });
+}
+
+/* If an old Nimbus server is still holding the port (left behind by a crash
+   or by updating while it ran), the new window would connect to it and show
+   the OLD app. Find whoever is listening and stop it if it's a Nimbus process. */
+function stopStaleNimbusServer(port) {
+  if (process.platform !== "win32") return false;
+  try {
+    const out = execFileSync("netstat", ["-ano", "-p", "TCP"], { encoding: "utf8", windowsHide: true });
+    const pids = new Set();
+    for (const line of out.split(/\r?\n/)) {
+      const cols = line.trim().split(/\s+/);
+      if (cols[0] === "TCP" && /LISTENING/i.test(cols[3] ?? "") && cols[1]?.endsWith(`:${port}`)) pids.add(cols[4]);
+    }
+    let stopped = false;
+    for (const pid of pids) {
+      if (!pid || pid === String(process.pid)) continue;
+      const info = execFileSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8", windowsHide: true });
+      if (/^"nimbus\.exe"/i.test(info.trim())) {
+        execFileSync("taskkill", ["/PID", pid, "/T", "/F"], { windowsHide: true });
+        stopped = true;
+      }
+    }
+    return stopped;
+  } catch {
+    return false;
+  }
+}
 let win = null;
 
 function waitForServer(url, timeoutMs = 15000) {
@@ -30,13 +68,13 @@ function waitForServer(url, timeoutMs = 15000) {
 
 /* Packaged builds ship a standalone Next.js server (output: "standalone")
    so API routes keep working — a static export can't serve /api routes. */
-function startStandaloneServer() {
+function startStandaloneServer(port) {
   const serverEntry = path.join(process.resourcesPath, "standalone", "server.js");
   serverProcess = spawn(process.execPath, [serverEntry], {
     env: {
       ...process.env,
       ELECTRON_RUN_AS_NODE: "1",
-      PORT: String(PORT),
+      PORT: String(port),
       NODE_ENV: "production",
       // Persistent memory must live in a writable per-user location, not in
       // the (possibly read-only) install directory, and must survive updates.
@@ -109,17 +147,34 @@ function attachContextMenu(window) {
 
 async function createWindow() {
   const isDev = !app.isPackaged;
-  const url = `http://localhost:${PORT}`;
 
-  win = new BrowserWindow({ width: 1200, height: 800 });
+  win = new BrowserWindow({ width: 1200, height: 800, title: `Nimbus ${app.getVersion()}` });
   attachContextMenu(win);
+  // Keep the version in the title bar so it's obvious which build is running.
+  win.on("page-title-updated", (event, title) => {
+    event.preventDefault();
+    win.setTitle(`${title} — v${app.getVersion()}`);
+  });
 
   if (isDev) {
-    win.loadURL(url);
+    win.loadURL(`http://localhost:${PORT}`);
     return;
   }
 
-  startStandaloneServer();
+  const url = `http://localhost:${PORT}`;
+  if (!(await isPortFree(PORT))) {
+    stopStaleNimbusServer(PORT);
+    await new Promise((r) => setTimeout(r, 500));
+    if (!(await isPortFree(PORT))) {
+      dialog.showErrorBox(
+        "Nimbus can't start",
+        `Port ${PORT} is already in use by another program (for example a dev server from "npm run dev"). Close it and open Nimbus again.`
+      );
+      app.quit();
+      return;
+    }
+  }
+  startStandaloneServer(PORT);
   try {
     await waitForServer(url);
     win.loadURL(url);
@@ -151,6 +206,15 @@ if (!gotLock) {
   });
 }
 
-app.on("before-quit", () => {
-  serverProcess?.kill();
-});
+function stopServer() {
+  if (!serverProcess || serverProcess.killed) return;
+  // On Windows, kill() can leave the server running; end the whole process tree.
+  if (process.platform === "win32") {
+    spawn("taskkill", ["/pid", String(serverProcess.pid), "/T", "/F"], { windowsHide: true });
+  } else {
+    serverProcess.kill();
+  }
+}
+
+app.on("before-quit", stopServer);
+process.on("exit", stopServer);

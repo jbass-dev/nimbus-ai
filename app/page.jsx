@@ -4,6 +4,9 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import Sidebar from "./components/Sidebar";
 import MessageBubble from "./components/MessageBubble";
 import PermissionsPanel from "./components/PermissionsPanel";
+import { DEFAULT_ALWAYS_ALLOW } from "@/lib/nimbus/permissions.mjs";
+import AttachmentChips from "./components/AttachmentChips";
+import { ACCEPT, MAX_ATTACHMENTS, readAttachment, toRequestMessage } from "@/lib/ui/attachments.mjs";
 import MemoryPanel from "./components/MemoryPanel";
 import { MODELS, DEFAULT_MODEL } from "./config/models";
 
@@ -28,8 +31,13 @@ export default function Home() {
   // overwrite storage with the empty initial state on first render.
   const [loaded, setLoaded] = useState(false);
   // Search permission groups the user chose "Always allow" for; everything else asks first.
-  const [alwaysAllow, setAlwaysAllow] = useState([]);
+  const [alwaysAllow, setAlwaysAllow] = useState(DEFAULT_ALWAYS_ALLOW);
   const [showPermissions, setShowPermissions] = useState(false);
+  const [attachments, setAttachments] = useState([]); // waiting in the composer
+  const [attaching, setAttaching] = useState(0); // files still being read
+  const [attachError, setAttachError] = useState(null);
+  const [dragging, setDragging] = useState(false);
+  const fileInputRef = useRef(null);
 
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
@@ -76,7 +84,8 @@ export default function Home() {
         setModel(savedModel);
       }
 
-      const savedPerms = JSON.parse(localStorage.getItem("searchPermissions") ?? "[]");
+      // v2 key: everyone starts from the new defaults once; later changes stick.
+      const savedPerms = JSON.parse(localStorage.getItem("searchPermissions.v2") ?? "null");
       if (Array.isArray(savedPerms)) setAlwaysAllow(savedPerms.filter((g) => typeof g === "string"));
     } catch {
       // Corrupted storage — start fresh
@@ -85,10 +94,27 @@ export default function Home() {
   }, []);
   /* eslint-enable react-hooks/set-state-in-effect */
 
-  // Persist chats
+  // Persist chats. Images can fill browser storage; if they do, save the chats
+  // without image data (they stay visible until the app is closed).
   useEffect(() => {
     if (!loaded) return;
-    localStorage.setItem("chatSessions", JSON.stringify(chatSessions));
+    try {
+      localStorage.setItem("chatSessions", JSON.stringify(chatSessions));
+    } catch {
+      try {
+        const slim = chatSessions.map((chat) => ({
+          ...chat,
+          messages: chat.messages.map((m) =>
+            m.attachments?.some((a) => a.dataUrl)
+              ? { ...m, attachments: m.attachments.map((a) => ({ ...a, dataUrl: undefined })) }
+              : m
+          ),
+        }));
+        localStorage.setItem("chatSessions", JSON.stringify(slim));
+      } catch {
+        // storage unavailable — chats still work for this session
+      }
+    }
   }, [chatSessions, loaded]);
 
   useEffect(() => {
@@ -108,7 +134,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!loaded) return;
-    localStorage.setItem("searchPermissions", JSON.stringify(alwaysAllow));
+    localStorage.setItem("searchPermissions.v2", JSON.stringify(alwaysAllow));
   }, [alwaysAllow, loaded]);
 
   // Auto-scroll
@@ -273,7 +299,8 @@ export default function Home() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             // Only role + content go upstream; UI-only fields stay local.
-            messages: history.map(({ role, content }) => ({ role, content })),
+            // Only role, text, attached-file text and images go upstream; UI-only fields stay local.
+            messages: history.map(toRequestMessage),
             model,
             confirmedActions,
             permissions: { always: alwaysList, once: allowOnce },
@@ -359,8 +386,10 @@ export default function Home() {
   const sendMessage = useCallback(
     async (overrideText) => {
       const trimmed = (overrideText ?? text).trim();
+      // Suggestion buttons pass their own text and never carry attachments.
+      const files = overrideText == null ? attachments : [];
 
-      if (!trimmed || isStreaming) return;
+      if ((!trimmed && !files.length) || isStreaming || attaching) return;
 
       if (trimmed.length > MAX_INPUT_LENGTH) {
         alert(
@@ -377,31 +406,24 @@ export default function Home() {
       const chatExists =
         chatId && chatSessions.some((chat) => chat.id === chatId);
 
+      const userMessage = files.length
+        ? { role: "user", content: trimmed, attachments: files }
+        : { role: "user", content: trimmed };
+
       if (!chatExists) {
         chatId = createChat();
-
-        history = [
-          {
-            role: "user",
-            content: trimmed,
-          },
-        ];
+        history = [userMessage];
       } else {
         const chat = chatSessions.find(
           (chat) => chat.id === chatId
         );
-
-        history = [
-          ...(chat?.messages ?? []),
-          {
-            role: "user",
-            content: trimmed,
-          },
-        ];
+        history = [...(chat?.messages ?? []), userMessage];
       }
 
       updateChatMessages(chatId, history);
       setText("");
+      if (files.length) setAttachments([]);
+      setAttachError(null);
 
       if (textareaRef.current) {
         textareaRef.current.style.height = "auto";
@@ -412,10 +434,11 @@ export default function Home() {
           .length === 1;
 
       if (isFirstUserMessage) {
+        const base = trimmed || files[0]?.name || "Attachment";
         const title =
-          trimmed.length > 34
-            ? `${trimmed.slice(0, 34)}…`
-            : trimmed;
+          base.length > 34
+            ? `${base.slice(0, 34)}…`
+            : base;
 
         setChatTitle(chatId, title);
       }
@@ -424,6 +447,8 @@ export default function Home() {
     },
     [
       text,
+      attachments,
+      attaching,
       isStreaming,
       chatSessions,
       createChat,
@@ -492,6 +517,59 @@ export default function Home() {
     [activeChat, isStreaming, patchLastAssistant, streamCompletion]
   );
 
+  /* Add files from the picker, a paste, or a drop. */
+  const addFiles = useCallback(
+    async (fileList) => {
+      const files = [...(fileList ?? [])];
+      if (!files.length) return;
+      const room = MAX_ATTACHMENTS - attachments.length - attaching;
+      if (room <= 0) {
+        setAttachError(`You can attach up to ${MAX_ATTACHMENTS} files per message.`);
+        return;
+      }
+      const picked = files.slice(0, room);
+      setAttachError(files.length > room ? `Only the first ${room} file${room === 1 ? "" : "s"} were added (max ${MAX_ATTACHMENTS}).` : null);
+      setAttaching((n) => n + picked.length);
+      for (const file of picked) {
+        try {
+          const att = await readAttachment(file);
+          setAttachments((prev) => [...prev, att]);
+        } catch (err) {
+          setAttachError(err.message);
+        } finally {
+          setAttaching((n) => n - 1);
+        }
+      }
+      textareaRef.current?.focus();
+    },
+    [attachments.length, attaching]
+  );
+
+  const handlePaste = useCallback(
+    (event) => {
+      const files = [...(event.clipboardData?.files ?? [])];
+      if (files.length) {
+        event.preventDefault();
+        addFiles(files);
+      }
+    },
+    [addFiles]
+  );
+
+  /* Edit a sent message: keep everything before it, replace it, and get a
+     fresh reply. Later messages are dropped, like ChatGPT/Claude. */
+  const editMessage = useCallback(
+    (index, newText) => {
+      if (!activeChat || isStreaming) return;
+      const original = activeChat.messages[index];
+      if (original?.role !== "user") return;
+      const history = [...activeChat.messages.slice(0, index), { ...original, content: newText }];
+      updateChatMessages(activeChat.id, history);
+      streamCompletion(activeChat.id, history);
+    },
+    [activeChat, isStreaming, updateChatMessages, streamCompletion]
+  );
+
   const stopGeneration = useCallback(() => {
     abortRef.current?.abort();
   }, []);
@@ -535,6 +613,12 @@ export default function Home() {
         }}
         onNewChat={() => createChat()}
         onOpenMemory={() => setShowMemory(true)}
+        onRenameChat={setChatTitle}
+        onTogglePin={(id) =>
+          setChatSessions((prev) =>
+            prev.map((chat) => (chat.id === id ? { ...chat, pinned: !chat.pinned } : chat))
+          )
+        }
         onDeleteChat={(id) => {
           setChatSessions((prev) =>
             prev.filter((chat) => chat.id !== id)
@@ -672,6 +756,8 @@ export default function Home() {
                   onRegenerate={regenerate}
                   onConfirm={confirmAction}
                   onPermission={respondToPermission}
+                  canEdit={message.role === "user" && !isStreaming}
+                  onEdit={(text) => editMessage(index, text)}
                 />
               ))}
 
@@ -681,9 +767,69 @@ export default function Home() {
         </div>
 
         {/* Input */}
-        <div className="border-t border-neutral-800/80 p-3 shrink-0">
+        <div
+          className="border-t border-neutral-800/80 p-3 shrink-0"
+          onDragOver={(e) => {
+            if ([...e.dataTransfer.types].includes("Files")) {
+              e.preventDefault();
+              setDragging(true);
+            }
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget)) setDragging(false);
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragging(false);
+            addFiles(e.dataTransfer.files);
+          }}
+        >
           <div className="max-w-3xl mx-auto">
-            <div className="flex items-end gap-2 bg-neutral-900 border border-neutral-700 rounded-2xl p-2 focus-within:border-indigo-500 transition-colors">
+            {attachError && (
+              <p className="mb-2 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-xs text-red-300">
+                {attachError}
+              </p>
+            )}
+            <div
+              className={`bg-neutral-900 border rounded-2xl p-2 transition-colors ${
+                dragging ? "border-indigo-400 bg-indigo-500/10" : "border-neutral-700 focus-within:border-indigo-500"
+              }`}
+            >
+            {(attachments.length > 0 || attaching > 0) && (
+              <div className="px-1 pb-2 pt-1">
+                <AttachmentChips
+                  attachments={attachments}
+                  onRemove={(id) => setAttachments((prev) => prev.filter((a) => a.id !== id))}
+                />
+                {attaching > 0 && (
+                  <p className="mt-1.5 text-xs text-neutral-400 animate-pulse">
+                    Reading {attaching} file{attaching === 1 ? "" : "s"}…
+                  </p>
+                )}
+              </div>
+            )}
+            <div className="flex items-end gap-2">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept={ACCEPT}
+                className="hidden"
+                onChange={(e) => {
+                  addFiles(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isStreaming}
+                className="h-9 w-9 shrink-0 rounded-xl text-lg text-neutral-400 hover:bg-white/10 hover:text-white disabled:opacity-40 transition-colors"
+                aria-label="Attach files or images"
+                title="Attach files or images (PDF, Word, images, text/code). You can also paste or drop them."
+              >
+                📎
+              </button>
               <textarea
                 ref={textareaRef}
                 autoFocus
@@ -697,6 +843,7 @@ export default function Home() {
                 }
                 onInput={autoGrow}
                 onKeyDown={handleKey}
+                onPaste={handlePaste}
               />
 
               {isStreaming ? (
@@ -711,17 +858,17 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={() => sendMessage()}
-                  disabled={!text.trim()}
+                  disabled={(!text.trim() && !attachments.length) || attaching > 0}
                   className="px-4 py-2 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl text-sm font-medium transition-all shrink-0"
                 >
                   Send
                 </button>
               )}
             </div>
+            </div>
 
             <p className="text-[11px] text-neutral-600 text-center mt-2">
-              Nimbus can make mistakes — check links before acting.
-              Tool activity shown above each reply is what actually ran.
+              Nimbus can make mistakes — check links before acting. Attach files with 📎, or paste/drop them.
             </p>
           </div>
         </div>

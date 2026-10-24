@@ -1,4 +1,4 @@
-import { MODELS, resolveUpstreamModel } from "../../config/models";
+import { MODELS, VISION_MODEL, resolveUpstreamModel } from "../../config/models";
 import { runAgent } from "@/lib/nimbus/agent.mjs";
 import { createOpenRouterClient } from "@/lib/nimbus/llm.mjs";
 import { resolveIdentity } from "@/lib/nimbus/identity.mjs";
@@ -11,8 +11,10 @@ export const maxDuration = 120;
 
 // --- Request limits -------------------------------------------------------
 const MAX_MESSAGES = 60; // caps how much history gets forwarded upstream
-const MAX_MESSAGE_LENGTH = 8000; // chars, per message
-const MAX_TOTAL_LENGTH = 60000; // chars, across the whole conversation
+const MAX_MESSAGE_LENGTH = 100_000; // chars, per message (attached file text included)
+const MAX_TOTAL_LENGTH = 200_000; // chars, across the whole conversation
+const MAX_IMAGES_PER_MESSAGE = 4;
+const MAX_IMAGE_CHARS = 4_000_000; // ~3 MB per image as a data URL
 
 // Past chats sent for search_chats (only when that permission is granted).
 const ARCHIVE_MAX_CHATS = 60;
@@ -78,7 +80,14 @@ function validateMessages(messages) {
   let totalLength = 0;
   for (const m of messages) {
     if (!m || typeof m.content !== "string" || typeof m.role !== "string") return "Malformed message in conversation.";
-    if (m.content.length > MAX_MESSAGE_LENGTH) return `A message exceeds the ${MAX_MESSAGE_LENGTH}-character limit.`;
+    if (m.content.length > MAX_MESSAGE_LENGTH) return `A message (with its attached files) is over the ${MAX_MESSAGE_LENGTH.toLocaleString("en-US")}-character limit.`;
+    if (m.images !== undefined) {
+      if (!Array.isArray(m.images) || m.images.length > MAX_IMAGES_PER_MESSAGE) return `Up to ${MAX_IMAGES_PER_MESSAGE} images per message.`;
+      for (const img of m.images) {
+        if (typeof img !== "string" || !/^data:image\/(png|jpe?g|webp|gif);base64,/.test(img)) return "Unsupported image format.";
+        if (img.length > MAX_IMAGE_CHARS) return "An attached image is too large.";
+      }
+    }
     totalLength += m.content.length;
   }
   if (totalLength > MAX_TOTAL_LENGTH) return "Conversation is too long for this request. Start a new chat.";
@@ -110,7 +119,14 @@ export async function POST(req) {
     const validationError = validateMessages(messages);
     if (validationError) return jsonError(validationError, 400, setCookie);
 
-    const modelSlug = MODELS[model] ? model : undefined;
+    let modelSlug = MODELS[model] ? model : undefined;
+    // Images need a model that can see. Use the vision model for this reply if needed.
+    const hasImages = messages.some((m) => Array.isArray(m.images) && m.images.length);
+    let visionNotice = null;
+    if (hasImages && !(modelSlug && MODELS[modelSlug].vision)) {
+      visionNotice = `${MODELS[modelSlug]?.label ?? "This model"} can't read images, so ${MODELS[VISION_MODEL].label} answered this one.`;
+      modelSlug = VISION_MODEL;
+    }
     const upstreamModel = resolveUpstreamModel(modelSlug);
     const supportsTools = (modelSlug ? MODELS[modelSlug] : null)?.tools !== false;
     const llm = createOpenRouterClient({
@@ -131,6 +147,7 @@ export async function POST(req) {
             closed = true;
           }
         };
+        if (visionNotice) emit({ type: "notice", level: "info", text: visionNotice });
         try {
           const { metrics } = await runAgent({
             messages,
