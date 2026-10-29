@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseStream, createOpenRouterClient, isToolUnsupportedError, LlmError } from "../lib/nimbus/llm.mjs";
+import { parseStream, createOpenRouterClient, isToolUnsupportedError, LlmError, DEFAULT_MAX_TOKENS, describeProviderError } from "../lib/nimbus/llm.mjs";
 import { resolveIdentity, parseCookies, COOKIE_NAME } from "../lib/nimbus/identity.mjs";
 
 function sse(lines) {
@@ -55,6 +55,33 @@ test("HTTP errors are classified (retryable, tool-unsupported) and the key is se
   const c3 = createOpenRouterClient({ apiKey: "k", fetchImpl: async () => { throw new TypeError("fetch failed"); } });
   const e3 = await c3.chat({ model: "x", messages: [] }).catch((e) => e);
   assert.match(e3.message, /Could not reach/);
+});
+
+test("every request caps max_tokens so low-balance keys aren't refused for the model's full output limit", async () => {
+  const bodies = [];
+  const ok = async (url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return new Response("data: [DONE]\n\n", { status: 200 });
+  };
+  await createOpenRouterClient({ apiKey: "k", fetchImpl: ok }).chat({ model: "x", messages: [] });
+  await createOpenRouterClient({ apiKey: "k", fetchImpl: ok, maxTokens: 512 }).chat({ model: "x", messages: [] });
+  assert.equal(bodies[0].max_tokens, DEFAULT_MAX_TOKENS);
+  assert.equal(bodies[1].max_tokens, 512);
+});
+
+test("provider errors become messages the user can act on", async () => {
+  const fail = (status, body) => createOpenRouterClient({ apiKey: "sk-secret", fetchImpl: async () => new Response(body, { status }) })
+    .chat({ model: "x", messages: [] }).catch((e) => e);
+  const credits = await fail(402, '{"error":{"message":"This request requires more credits, or fewer max_tokens.","code":402}}');
+  assert.match(credits.message, /credits are too low/);
+  assert.equal(credits.retryable, false);
+  const limited = await fail(429, '{"error":{"message":"Provider returned error","code":429}}');
+  assert.match(limited.message, /rate-limited/);
+  assert.equal(limited.retryable, true);
+  assert.match((await fail(401, "{}")).message, /rejected the API key/);
+  assert.match((await fail(400, '{"error":{"message":"Invalid model id"}}')).message, /\(400\): Invalid model id/);
+  assert.doesNotMatch(credits.message + limited.message, /sk-secret/);
+  assert.equal(describeProviderError(503, "not json"), "Model provider error (503)");
 });
 
 test("identity: new visitors get a random HttpOnly cookie; returning visitors keep their key", () => {
