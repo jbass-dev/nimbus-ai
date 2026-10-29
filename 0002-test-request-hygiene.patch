@@ -1,0 +1,443 @@
+From f87fb78f94ca8e5d5facbb4e29780bb32a82ffad Mon Sep 17 00:00:00 2001
+From: John Bass <bassjohn159@yahoo.com>
+Date: Thu, 29 Oct 2026 14:35:13 -0500
+Subject: [PATCH] Test request hygiene: extract route validation, rate limiting
+ and model allowlist
+
+- Move validateMessages, sanitizeArchive, rate limiter and model selection from
+  the API route into lib/nimbus/request.mjs so they can be unit-tested
+- Model allowlist uses Object.hasOwn (prototype keys like __proto__ no longer match)
+- Rate limiter is a factory with an injectable clock
+- New tests: request limits, image rules, archive sanitizing, rate limiting,
+  model allowlist/vision fallback, agent wall-clock deadline, duplicate-call cache
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019rgcayND8hS81m8p7pEv6W
+---
+ app/api/OpenRouter/route.js |  90 +----------------------
+ lib/nimbus/request.mjs      | 103 +++++++++++++++++++++++++++
+ tests/agent.test.mjs        |  34 +++++++++
+ tests/request.test.mjs      | 138 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 278 insertions(+), 87 deletions(-)
+ create mode 100644 lib/nimbus/request.mjs
+ create mode 100644 tests/request.test.mjs
+
+diff --git a/app/api/OpenRouter/route.js b/app/api/OpenRouter/route.js
+index 46aab44..7845548 100644
+--- a/app/api/OpenRouter/route.js
++++ b/app/api/OpenRouter/route.js
+@@ -1,4 +1,5 @@
+ import { MODELS, VISION_MODEL, resolveUpstreamModel } from "../../config/models";
++import { validateMessages, sanitizeArchive, createRateLimiter, getClientIp, chooseModel } from "@/lib/nimbus/request.mjs";
+ import { runAgent } from "@/lib/nimbus/agent.mjs";
+ import { createOpenRouterClient } from "@/lib/nimbus/llm.mjs";
+ import { resolveIdentity } from "@/lib/nimbus/identity.mjs";
+@@ -9,64 +10,7 @@ import { normalizePermissions } from "@/lib/nimbus/permissions.mjs";
+ export const runtime = "nodejs";
+ export const maxDuration = 120;
+ 
+-// --- Request limits -------------------------------------------------------
+-const MAX_MESSAGES = 60; // caps how much history gets forwarded upstream
+-const MAX_MESSAGE_LENGTH = 100_000; // chars, per message (attached file text included)
+-const MAX_TOTAL_LENGTH = 200_000; // chars, across the whole conversation
+-const MAX_IMAGES_PER_MESSAGE = 4;
+-const MAX_IMAGE_CHARS = 4_000_000; // ~3 MB per image as a data URL
+-
+-// Past chats sent for search_chats (only when that permission is granted).
+-const ARCHIVE_MAX_CHATS = 60;
+-const ARCHIVE_MAX_MESSAGES = 40; // per chat
+-const ARCHIVE_MAX_MESSAGE = 1500; // chars
+-const ARCHIVE_MAX_TOTAL = 300_000; // chars across the archive
+-
+-function sanitizeArchive(archive) {
+-  if (!Array.isArray(archive)) return null;
+-  const out = [];
+-  let total = 0;
+-  for (const chat of archive.slice(0, ARCHIVE_MAX_CHATS)) {
+-    if (!chat || typeof chat.id !== "string") continue;
+-    const messages = [];
+-    for (const m of Array.isArray(chat.messages) ? chat.messages.slice(-ARCHIVE_MAX_MESSAGES) : []) {
+-      if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.content !== "string" || !m.content.trim()) continue;
+-      const content = m.content.slice(0, ARCHIVE_MAX_MESSAGE);
+-      if (total + content.length > ARCHIVE_MAX_TOTAL) break;
+-      total += content.length;
+-      messages.push({ role: m.role, content });
+-    }
+-    out.push({ id: chat.id.slice(0, 64), title: String(chat.title ?? "").slice(0, 200), messages });
+-    if (total >= ARCHIVE_MAX_TOTAL) break;
+-  }
+-  return out;
+-}
+-
+-// --- Rate limiting ---------------------------------------------------------
+-// Simple in-memory sliding-window limiter, keyed by client IP. Process-local:
+-// fine for a single instance; swap for Redis/Upstash across a fleet.
+-const RATE_LIMIT_WINDOW_MS = 60_000;
+-const RATE_LIMIT_MAX_REQUESTS = 20;
+-const rateLimitHits = new Map(); // ip -> array of request timestamps
+-
+-function isRateLimited(ip) {
+-  const now = Date.now();
+-  const hits = (rateLimitHits.get(ip) ?? []).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+-  hits.push(now);
+-  rateLimitHits.set(ip, hits);
+-  if (rateLimitHits.size > 5000) {
+-    for (const [key, timestamps] of rateLimitHits) {
+-      if (timestamps.every((t) => now - t >= RATE_LIMIT_WINDOW_MS)) rateLimitHits.delete(key);
+-    }
+-  }
+-  return hits.length > RATE_LIMIT_MAX_REQUESTS;
+-}
+-
+-function getClientIp(req) {
+-  const forwarded = req.headers.get("x-forwarded-for");
+-  if (forwarded) return forwarded.split(",")[0].trim();
+-  return req.headers.get("x-real-ip") ?? "unknown";
+-}
++const isRateLimited = createRateLimiter();
+ 
+ function jsonError(message, status, setCookie) {
+   const headers = { "Content-Type": "application/json" };
+@@ -74,26 +18,6 @@ function jsonError(message, status, setCookie) {
+   return new Response(JSON.stringify({ error: message }), { status, headers });
+ }
+ 
+-function validateMessages(messages) {
+-  if (!Array.isArray(messages) || messages.length === 0) return "No messages provided.";
+-  if (messages.length > MAX_MESSAGES) return `Too many messages (max ${MAX_MESSAGES}). Start a new chat.`;
+-  let totalLength = 0;
+-  for (const m of messages) {
+-    if (!m || typeof m.content !== "string" || typeof m.role !== "string") return "Malformed message in conversation.";
+-    if (m.content.length > MAX_MESSAGE_LENGTH) return `A message (with its attached files) is over the ${MAX_MESSAGE_LENGTH.toLocaleString("en-US")}-character limit.`;
+-    if (m.images !== undefined) {
+-      if (!Array.isArray(m.images) || m.images.length > MAX_IMAGES_PER_MESSAGE) return `Up to ${MAX_IMAGES_PER_MESSAGE} images per message.`;
+-      for (const img of m.images) {
+-        if (typeof img !== "string" || !/^data:image\/(png|jpe?g|webp|gif);base64,/.test(img)) return "Unsupported image format.";
+-        if (img.length > MAX_IMAGE_CHARS) return "An attached image is too large.";
+-      }
+-    }
+-    totalLength += m.content.length;
+-  }
+-  if (totalLength > MAX_TOTAL_LENGTH) return "Conversation is too long for this request. Start a new chat.";
+-  return null;
+-}
+-
+ /**
+  * Streams newline-delimited JSON events:
+  *   {type:"intent"|"memory"|"tool_start"|"tool_end"|"confirm"|"permission"|"notice"|"token"|"done"|"error", ...}
+@@ -119,16 +43,8 @@ export async function POST(req) {
+     const validationError = validateMessages(messages);
+     if (validationError) return jsonError(validationError, 400, setCookie);
+ 
+-    let modelSlug = MODELS[model] ? model : undefined;
+-    // Images need a model that can see. Use the vision model for this reply if needed.
+-    const hasImages = messages.some((m) => Array.isArray(m.images) && m.images.length);
+-    let visionNotice = null;
+-    if (hasImages && !(modelSlug && MODELS[modelSlug].vision)) {
+-      visionNotice = `${MODELS[modelSlug]?.label ?? "This model"} can't read images, so ${MODELS[VISION_MODEL].label} answered this one.`;
+-      modelSlug = VISION_MODEL;
+-    }
++    const { modelSlug, visionNotice, supportsTools } = chooseModel({ requested: model, messages, models: MODELS, visionModel: VISION_MODEL });
+     const upstreamModel = resolveUpstreamModel(modelSlug);
+-    const supportsTools = (modelSlug ? MODELS[modelSlug] : null)?.tools !== false;
+     const llm = createOpenRouterClient({
+       apiKey: process.env.OPENROUTER_KEY,
+       // Override only for local smoke tests against a mock provider.
+diff --git a/lib/nimbus/request.mjs b/lib/nimbus/request.mjs
+new file mode 100644
+index 0000000..cf8e67d
+--- /dev/null
++++ b/lib/nimbus/request.mjs
+@@ -0,0 +1,103 @@
++// Request hygiene for /api/OpenRouter: size limits, archive sanitizing, rate
++// limiting and model allowlisting. Kept out of the route so it's unit-tested.
++
++export const REQUEST_LIMITS = {
++  MAX_MESSAGES: 60, // caps how much history gets forwarded upstream
++  MAX_MESSAGE_LENGTH: 100_000, // chars, per message (attached file text included)
++  MAX_TOTAL_LENGTH: 200_000, // chars, across the whole conversation
++  MAX_IMAGES_PER_MESSAGE: 4,
++  MAX_IMAGE_CHARS: 4_000_000, // ~3 MB per image as a data URL
++  // Past chats sent for search_chats (only when that permission is granted).
++  ARCHIVE_MAX_CHATS: 60,
++  ARCHIVE_MAX_MESSAGES: 40, // per chat
++  ARCHIVE_MAX_MESSAGE: 1500, // chars
++  ARCHIVE_MAX_TOTAL: 300_000, // chars across the archive
++};
++const {
++  MAX_MESSAGES, MAX_MESSAGE_LENGTH, MAX_TOTAL_LENGTH, MAX_IMAGES_PER_MESSAGE, MAX_IMAGE_CHARS,
++  ARCHIVE_MAX_CHATS, ARCHIVE_MAX_MESSAGES, ARCHIVE_MAX_MESSAGE, ARCHIVE_MAX_TOTAL,
++} = REQUEST_LIMITS;
++
++export function sanitizeArchive(archive) {
++  if (!Array.isArray(archive)) return null;
++  const out = [];
++  let total = 0;
++  for (const chat of archive.slice(0, ARCHIVE_MAX_CHATS)) {
++    if (!chat || typeof chat.id !== "string") continue;
++    const messages = [];
++    for (const m of Array.isArray(chat.messages) ? chat.messages.slice(-ARCHIVE_MAX_MESSAGES) : []) {
++      if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.content !== "string" || !m.content.trim()) continue;
++      const content = m.content.slice(0, ARCHIVE_MAX_MESSAGE);
++      if (total + content.length > ARCHIVE_MAX_TOTAL) break;
++      total += content.length;
++      messages.push({ role: m.role, content });
++    }
++    out.push({ id: chat.id.slice(0, 64), title: String(chat.title ?? "").slice(0, 200), messages });
++    if (total >= ARCHIVE_MAX_TOTAL) break;
++  }
++  return out;
++}
++
++/**
++ * In-memory sliding-window limiter keyed by client IP. Process-local: fine for
++ * a single instance (the desktop app, one serverless instance); swap for
++ * Redis/Upstash across a fleet. Returns isLimited(ip) → boolean.
++ */
++export function createRateLimiter({ windowMs = 60_000, max = 20, now = () => Date.now(), maxKeys = 5000 } = {}) {
++  const hits = new Map(); // ip -> request timestamps inside the window
++  return function isRateLimited(ip) {
++    const t = now();
++    const recent = (hits.get(ip) ?? []).filter((at) => t - at < windowMs);
++    recent.push(t);
++    hits.set(ip, recent);
++    if (hits.size > maxKeys) {
++      for (const [key, stamps] of hits) {
++        if (stamps.every((at) => t - at >= windowMs)) hits.delete(key);
++      }
++    }
++    return recent.length > max;
++  };
++}
++
++export function getClientIp(req) {
++  const forwarded = req.headers.get("x-forwarded-for");
++  if (forwarded) return forwarded.split(",")[0].trim();
++  return req.headers.get("x-real-ip") ?? "unknown";
++}
++
++export function validateMessages(messages) {
++  if (!Array.isArray(messages) || messages.length === 0) return "No messages provided.";
++  if (messages.length > MAX_MESSAGES) return `Too many messages (max ${MAX_MESSAGES}). Start a new chat.`;
++  let totalLength = 0;
++  for (const m of messages) {
++    if (!m || typeof m.content !== "string" || typeof m.role !== "string") return "Malformed message in conversation.";
++    if (m.content.length > MAX_MESSAGE_LENGTH) return `A message (with its attached files) is over the ${MAX_MESSAGE_LENGTH.toLocaleString("en-US")}-character limit.`;
++    if (m.images !== undefined) {
++      if (!Array.isArray(m.images) || m.images.length > MAX_IMAGES_PER_MESSAGE) return `Up to ${MAX_IMAGES_PER_MESSAGE} images per message.`;
++      for (const img of m.images) {
++        if (typeof img !== "string" || !/^data:image\/(png|jpe?g|webp|gif);base64,/.test(img)) return "Unsupported image format.";
++        if (img.length > MAX_IMAGE_CHARS) return "An attached image is too large.";
++      }
++    }
++    totalLength += m.content.length;
++  }
++  if (totalLength > MAX_TOTAL_LENGTH) return "Conversation is too long for this request. Start a new chat.";
++  return null;
++}
++
++/**
++ * Picks the model for this request. Only slugs from the allowlist are
++ * accepted (anything else → default, so a client can't route to an arbitrary
++ * paid model). Images force the vision model when the chosen one can't see.
++ */
++export function chooseModel({ requested, messages, models, visionModel }) {
++  let modelSlug = Object.hasOwn(models, requested ?? "") ? requested : undefined;
++  let visionNotice = null;
++  const hasImages = messages.some((m) => Array.isArray(m.images) && m.images.length);
++  if (hasImages && !(modelSlug && models[modelSlug].vision)) {
++    visionNotice = `${models[modelSlug]?.label ?? "This model"} can't read images, so ${models[visionModel].label} answered this one.`;
++    modelSlug = visionModel;
++  }
++  const supportsTools = (modelSlug ? models[modelSlug] : null)?.tools !== false;
++  return { modelSlug, visionNotice, supportsTools };
++}
+diff --git a/tests/agent.test.mjs b/tests/agent.test.mjs
+index f646fc0..c5f8b87 100644
+--- a/tests/agent.test.mjs
++++ b/tests/agent.test.mjs
+@@ -256,3 +256,37 @@ test("client abort propagates and stops the turn", async () => {
+   ]);
+   await assert.rejects(run([{ role: "user", content: "hi" }], { signal: controller.signal }), (e) => e.name === "AbortError" || /abort/i.test(e.message));
+ });
++
++test("wall-clock deadline: when time runs low the model gets no tools and must answer", async () => {
++  let t = 1_000_000;
++  const ping = { name: "ping", description: "ping", parameters: { type: "object", properties: { n: { type: "integer" } } }, run: async () => ({ pong: true }) };
++  const { llm, run } = await setup([
++    () => {
++      t += 85_000; // the first step (model + tool) eats most of the 90 s budget
++      return { toolCalls: [{ name: "ping", args: { n: 1 } }] };
++    },
++    { content: "Here's what I have so far." },
++  ]);
++  const { text, metrics } = await run([{ role: "user", content: "keep pinging" }], { tools: [ping], now: () => t });
++  assert.equal(llm.requests.length, 2);
++  assert.ok(llm.requests[0].tools?.length, "tools offered while there is time");
++  assert.equal(llm.requests[1].tools, undefined, "no tools offered once under the time floor");
++  assert.match(text, /what I have so far/);
++  assert.equal(metrics.steps, 2);
++});
++
++test("a repeated identical tool call is served from the turn cache, not re-run", async () => {
++  let runs = 0;
++  const ping = { name: "ping", description: "ping", parameters: { type: "object", properties: { n: { type: "integer" } } }, run: async () => ({ pong: ++runs }) };
++  const { llm, run } = await setup([
++    { toolCalls: [{ name: "ping", args: { n: 1 } }] },
++    { toolCalls: [{ name: "ping", args: { n: 1 } }] },
++    { content: "done" },
++  ]);
++  await run([{ role: "user", content: "ping twice" }], { tools: [ping] });
++  assert.equal(runs, 1, "tool body ran once");
++  const toolMsgs = llm.requests[2].messages.filter((m) => m.role === "tool").map((m) => JSON.parse(m.content));
++  assert.equal(toolMsgs.length, 2);
++  assert.match(toolMsgs[1].note, /Duplicate call/);
++  assert.deepEqual(toolMsgs[1].result, { pong: 1 });
++});
+diff --git a/tests/request.test.mjs b/tests/request.test.mjs
+new file mode 100644
+index 0000000..e12fa08
+--- /dev/null
++++ b/tests/request.test.mjs
+@@ -0,0 +1,138 @@
++// /api/OpenRouter request hygiene: size limits, image rules, archive
++// sanitizing, rate limiting and the model allowlist.
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import {
++  REQUEST_LIMITS, validateMessages, sanitizeArchive, createRateLimiter, getClientIp, chooseModel,
++} from "../lib/nimbus/request.mjs";
++
++const msg = (content, extra = {}) => ({ role: "user", content, ...extra });
++const PNG = "data:image/png;base64,iVBORw0KGgo=";
++
++test("validateMessages accepts a normal conversation", () => {
++  assert.equal(validateMessages([msg("hi"), { role: "assistant", content: "hello" }, msg("thanks")]), null);
++});
++
++test("validateMessages rejects empty, malformed and oversized input", () => {
++  assert.match(validateMessages([]), /No messages/);
++  assert.match(validateMessages("hi"), /No messages/);
++  assert.match(validateMessages([{ role: "user" }]), /Malformed/);
++  assert.match(validateMessages([null]), /Malformed/);
++  assert.match(validateMessages([{ role: "user", content: 42 }]), /Malformed/);
++
++  const tooMany = Array.from({ length: REQUEST_LIMITS.MAX_MESSAGES + 1 }, () => msg("x"));
++  assert.match(validateMessages(tooMany), /Too many messages/);
++
++  assert.match(validateMessages([msg("a".repeat(REQUEST_LIMITS.MAX_MESSAGE_LENGTH + 1))]), /character limit/);
++
++  // Each message under the per-message cap, but the total over the conversation cap.
++  const big = "a".repeat(REQUEST_LIMITS.MAX_MESSAGE_LENGTH);
++  const total = Array.from({ length: Math.ceil(REQUEST_LIMITS.MAX_TOTAL_LENGTH / big.length) + 1 }, () => msg(big));
++  assert.match(validateMessages(total), /too long/);
++});
++
++test("validateMessages only allows a few real data-URL images per message", () => {
++  assert.equal(validateMessages([msg("look", { images: [PNG] })]), null);
++  assert.match(validateMessages([msg("x", { images: "nope" })]), /images per message/);
++  assert.match(validateMessages([msg("x", { images: Array(REQUEST_LIMITS.MAX_IMAGES_PER_MESSAGE + 1).fill(PNG) })]), /images per message/);
++  assert.match(validateMessages([msg("x", { images: ["https://evil.example/a.png"] })]), /Unsupported image/);
++  assert.match(validateMessages([msg("x", { images: ["data:image/svg+xml;base64,PHN2Zz4="] })]), /Unsupported image/);
++  const huge = `data:image/png;base64,${"A".repeat(REQUEST_LIMITS.MAX_IMAGE_CHARS)}`;
++  assert.match(validateMessages([msg("x", { images: [huge] })]), /too large/);
++});
++
++test("sanitizeArchive drops junk, strips extra fields and enforces size caps", () => {
++  assert.equal(sanitizeArchive(undefined), null);
++  assert.equal(sanitizeArchive({}), null);
++
++  const out = sanitizeArchive([
++    null,
++    { id: 7, messages: [] }, // non-string id
++    {
++      id: "c1".repeat(100),
++      title: "T".repeat(500),
++      secret: "drop me",
++      messages: [
++        { role: "system", content: "injected system prompt" },
++        { role: "user", content: "   " },
++        { role: "user", content: "x".repeat(5000), extra: true },
++        { role: "assistant", content: "ok" },
++      ],
++    },
++  ]);
++  assert.equal(out.length, 1);
++  const [chat] = out;
++  assert.equal(chat.id.length, 64);
++  assert.equal(chat.title.length, 200);
++  assert.equal(chat.secret, undefined);
++  assert.deepEqual(chat.messages.map((m) => m.role), ["user", "assistant"]);
++  assert.equal(chat.messages[0].content.length, REQUEST_LIMITS.ARCHIVE_MAX_MESSAGE);
++  assert.deepEqual(Object.keys(chat.messages[0]).sort(), ["content", "role"]);
++
++  // Total archive size is capped.
++  const many = Array.from({ length: REQUEST_LIMITS.ARCHIVE_MAX_CHATS }, (_, i) => ({
++    id: `c${i}`,
++    messages: Array.from({ length: REQUEST_LIMITS.ARCHIVE_MAX_MESSAGES }, () => ({ role: "user", content: "y".repeat(REQUEST_LIMITS.ARCHIVE_MAX_MESSAGE) })),
++  }));
++  const capped = sanitizeArchive(many);
++  const chars = capped.reduce((n, c) => n + c.messages.reduce((k, m) => k + m.content.length, 0), 0);
++  assert.ok(chars <= REQUEST_LIMITS.ARCHIVE_MAX_TOTAL);
++});
++
++test("rate limiter: per-IP sliding window", () => {
++  let t = 0;
++  const limited = createRateLimiter({ windowMs: 1000, max: 3, now: () => t });
++  assert.deepEqual([1, 2, 3].map(() => limited("a")), [false, false, false]);
++  assert.equal(limited("a"), true, "4th request inside the window is limited");
++  assert.equal(limited("b"), false, "another IP has its own budget");
++  t = 1500; // the earlier hits slid out of the window
++  assert.equal(limited("a"), false);
++});
++
++test("rate limiter prunes idle IPs so memory stays bounded", () => {
++  let t = 0;
++  const limited = createRateLimiter({ windowMs: 100, max: 1, now: () => t, maxKeys: 10 });
++  for (let i = 0; i < 50; i++) limited(`ip${i}`);
++  t = 1000;
++  limited("fresh"); // triggers the prune
++  // A pruned IP starts over with a clean budget.
++  assert.equal(limited("ip0"), false);
++});
++
++test("getClientIp uses the first forwarded hop, then x-real-ip", () => {
++  const req = (h) => ({ headers: new Headers(h) });
++  assert.equal(getClientIp(req({ "x-forwarded-for": "203.0.113.5, 10.0.0.1" })), "203.0.113.5");
++  assert.equal(getClientIp(req({ "x-real-ip": "198.51.100.7" })), "198.51.100.7");
++  assert.equal(getClientIp(req({})), "unknown");
++});
++
++const MODELS = {
++  cheap: { label: "Cheap", upstream: "x/cheap" },
++  seer: { label: "Seer", upstream: "x/seer", vision: true },
++  notools: { label: "No Tools", upstream: "x/nt", tools: false },
++};
++const pick = (requested, messages = [msg("hi")]) => chooseModel({ requested, messages, models: MODELS, visionModel: "seer" });
++
++test("chooseModel: only allowlisted slugs pass; anything else uses the default", () => {
++  assert.equal(pick("cheap").modelSlug, "cheap");
++  assert.equal(pick("openai/gpt-5-pro").modelSlug, undefined, "raw upstream ids are not accepted");
++  assert.equal(pick("__proto__").modelSlug, undefined, "prototype keys are not models");
++  assert.equal(pick("toString").modelSlug, undefined);
++  assert.equal(pick(undefined).modelSlug, undefined);
++});
++
++test("chooseModel: images switch to the vision model with a notice", () => {
++  const withImage = [msg("what is this?", { images: [PNG] })];
++  const r = pick("cheap", withImage);
++  assert.equal(r.modelSlug, "seer");
++  assert.match(r.visionNotice, /Cheap can't read images, so Seer answered/);
++  const v = pick("seer", withImage);
++  assert.equal(v.modelSlug, "seer");
++  assert.equal(v.visionNotice, null);
++});
++
++test("chooseModel: tool support follows the model config", () => {
++  assert.equal(pick("cheap").supportsTools, true);
++  assert.equal(pick("notools").supportsTools, false);
++  assert.equal(pick(undefined).supportsTools, true);
++});
+-- 
+2.43.0
+

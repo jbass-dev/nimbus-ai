@@ -1,4 +1,5 @@
 import { MODELS, VISION_MODEL, resolveUpstreamModel } from "../../config/models";
+import { validateMessages, sanitizeArchive, createRateLimiter, getClientIp, chooseModel } from "@/lib/nimbus/request.mjs";
 import { runAgent } from "@/lib/nimbus/agent.mjs";
 import { createOpenRouterClient } from "@/lib/nimbus/llm.mjs";
 import { resolveIdentity } from "@/lib/nimbus/identity.mjs";
@@ -9,89 +10,12 @@ import { normalizePermissions } from "@/lib/nimbus/permissions.mjs";
 export const runtime = "nodejs";
 export const maxDuration = 120;
 
-// --- Request limits -------------------------------------------------------
-const MAX_MESSAGES = 60; // caps how much history gets forwarded upstream
-const MAX_MESSAGE_LENGTH = 100_000; // chars, per message (attached file text included)
-const MAX_TOTAL_LENGTH = 200_000; // chars, across the whole conversation
-const MAX_IMAGES_PER_MESSAGE = 4;
-const MAX_IMAGE_CHARS = 4_000_000; // ~3 MB per image as a data URL
-
-// Past chats sent for search_chats (only when that permission is granted).
-const ARCHIVE_MAX_CHATS = 60;
-const ARCHIVE_MAX_MESSAGES = 40; // per chat
-const ARCHIVE_MAX_MESSAGE = 1500; // chars
-const ARCHIVE_MAX_TOTAL = 300_000; // chars across the archive
-
-function sanitizeArchive(archive) {
-  if (!Array.isArray(archive)) return null;
-  const out = [];
-  let total = 0;
-  for (const chat of archive.slice(0, ARCHIVE_MAX_CHATS)) {
-    if (!chat || typeof chat.id !== "string") continue;
-    const messages = [];
-    for (const m of Array.isArray(chat.messages) ? chat.messages.slice(-ARCHIVE_MAX_MESSAGES) : []) {
-      if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.content !== "string" || !m.content.trim()) continue;
-      const content = m.content.slice(0, ARCHIVE_MAX_MESSAGE);
-      if (total + content.length > ARCHIVE_MAX_TOTAL) break;
-      total += content.length;
-      messages.push({ role: m.role, content });
-    }
-    out.push({ id: chat.id.slice(0, 64), title: String(chat.title ?? "").slice(0, 200), messages });
-    if (total >= ARCHIVE_MAX_TOTAL) break;
-  }
-  return out;
-}
-
-// --- Rate limiting ---------------------------------------------------------
-// Simple in-memory sliding-window limiter, keyed by client IP. Process-local:
-// fine for a single instance; swap for Redis/Upstash across a fleet.
-const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_REQUESTS = 20;
-const rateLimitHits = new Map(); // ip -> array of request timestamps
-
-function isRateLimited(ip) {
-  const now = Date.now();
-  const hits = (rateLimitHits.get(ip) ?? []).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
-  hits.push(now);
-  rateLimitHits.set(ip, hits);
-  if (rateLimitHits.size > 5000) {
-    for (const [key, timestamps] of rateLimitHits) {
-      if (timestamps.every((t) => now - t >= RATE_LIMIT_WINDOW_MS)) rateLimitHits.delete(key);
-    }
-  }
-  return hits.length > RATE_LIMIT_MAX_REQUESTS;
-}
-
-function getClientIp(req) {
-  const forwarded = req.headers.get("x-forwarded-for");
-  if (forwarded) return forwarded.split(",")[0].trim();
-  return req.headers.get("x-real-ip") ?? "unknown";
-}
+const isRateLimited = createRateLimiter();
 
 function jsonError(message, status, setCookie) {
   const headers = { "Content-Type": "application/json" };
   if (setCookie) headers["Set-Cookie"] = setCookie;
   return new Response(JSON.stringify({ error: message }), { status, headers });
-}
-
-function validateMessages(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return "No messages provided.";
-  if (messages.length > MAX_MESSAGES) return `Too many messages (max ${MAX_MESSAGES}). Start a new chat.`;
-  let totalLength = 0;
-  for (const m of messages) {
-    if (!m || typeof m.content !== "string" || typeof m.role !== "string") return "Malformed message in conversation.";
-    if (m.content.length > MAX_MESSAGE_LENGTH) return `A message (with its attached files) is over the ${MAX_MESSAGE_LENGTH.toLocaleString("en-US")}-character limit.`;
-    if (m.images !== undefined) {
-      if (!Array.isArray(m.images) || m.images.length > MAX_IMAGES_PER_MESSAGE) return `Up to ${MAX_IMAGES_PER_MESSAGE} images per message.`;
-      for (const img of m.images) {
-        if (typeof img !== "string" || !/^data:image\/(png|jpe?g|webp|gif);base64,/.test(img)) return "Unsupported image format.";
-        if (img.length > MAX_IMAGE_CHARS) return "An attached image is too large.";
-      }
-    }
-    totalLength += m.content.length;
-  }
-  if (totalLength > MAX_TOTAL_LENGTH) return "Conversation is too long for this request. Start a new chat.";
-  return null;
 }
 
 /**
@@ -119,16 +43,8 @@ export async function POST(req) {
     const validationError = validateMessages(messages);
     if (validationError) return jsonError(validationError, 400, setCookie);
 
-    let modelSlug = MODELS[model] ? model : undefined;
-    // Images need a model that can see. Use the vision model for this reply if needed.
-    const hasImages = messages.some((m) => Array.isArray(m.images) && m.images.length);
-    let visionNotice = null;
-    if (hasImages && !(modelSlug && MODELS[modelSlug].vision)) {
-      visionNotice = `${MODELS[modelSlug]?.label ?? "This model"} can't read images, so ${MODELS[VISION_MODEL].label} answered this one.`;
-      modelSlug = VISION_MODEL;
-    }
+    const { modelSlug, visionNotice, supportsTools } = chooseModel({ requested: model, messages, models: MODELS, visionModel: VISION_MODEL });
     const upstreamModel = resolveUpstreamModel(modelSlug);
-    const supportsTools = (modelSlug ? MODELS[modelSlug] : null)?.tools !== false;
     const llm = createOpenRouterClient({
       apiKey: process.env.OPENROUTER_KEY,
       // Override only for local smoke tests against a mock provider.

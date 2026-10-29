@@ -256,3 +256,37 @@ test("client abort propagates and stops the turn", async () => {
   ]);
   await assert.rejects(run([{ role: "user", content: "hi" }], { signal: controller.signal }), (e) => e.name === "AbortError" || /abort/i.test(e.message));
 });
+
+test("wall-clock deadline: when time runs low the model gets no tools and must answer", async () => {
+  let t = 1_000_000;
+  const ping = { name: "ping", description: "ping", parameters: { type: "object", properties: { n: { type: "integer" } } }, run: async () => ({ pong: true }) };
+  const { llm, run } = await setup([
+    () => {
+      t += 85_000; // the first step (model + tool) eats most of the 90 s budget
+      return { toolCalls: [{ name: "ping", args: { n: 1 } }] };
+    },
+    { content: "Here's what I have so far." },
+  ]);
+  const { text, metrics } = await run([{ role: "user", content: "keep pinging" }], { tools: [ping], now: () => t });
+  assert.equal(llm.requests.length, 2);
+  assert.ok(llm.requests[0].tools?.length, "tools offered while there is time");
+  assert.equal(llm.requests[1].tools, undefined, "no tools offered once under the time floor");
+  assert.match(text, /what I have so far/);
+  assert.equal(metrics.steps, 2);
+});
+
+test("a repeated identical tool call is served from the turn cache, not re-run", async () => {
+  let runs = 0;
+  const ping = { name: "ping", description: "ping", parameters: { type: "object", properties: { n: { type: "integer" } } }, run: async () => ({ pong: ++runs }) };
+  const { llm, run } = await setup([
+    { toolCalls: [{ name: "ping", args: { n: 1 } }] },
+    { toolCalls: [{ name: "ping", args: { n: 1 } }] },
+    { content: "done" },
+  ]);
+  await run([{ role: "user", content: "ping twice" }], { tools: [ping] });
+  assert.equal(runs, 1, "tool body ran once");
+  const toolMsgs = llm.requests[2].messages.filter((m) => m.role === "tool").map((m) => JSON.parse(m.content));
+  assert.equal(toolMsgs.length, 2);
+  assert.match(toolMsgs[1].note, /Duplicate call/);
+  assert.deepEqual(toolMsgs[1].result, { pong: 1 });
+});

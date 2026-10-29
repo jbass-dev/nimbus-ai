@@ -1,0 +1,218 @@
+From c12ceb357ce553ef639b5f5dd186a312c0d3d9cc Mon Sep 17 00:00:00 2001
+From: John Bass <bassjohn159@yahoo.com>
+Date: Thu, 29 Oct 2026 14:38:20 -0500
+Subject: [PATCH] Rewrite README for reviewers: highlights, turn diagram,
+ failure handling, security, trade-offs
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019rgcayND8hS81m8p7pEv6W
+---
+ README.md | 141 +++++++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 103 insertions(+), 38 deletions(-)
+
+diff --git a/README.md b/README.md
+index ca66c73..506819c 100644
+--- a/README.md
++++ b/README.md
+@@ -1,8 +1,27 @@
+-# Nimbus — AI Chat Interface
++# Nimbus: a desktop-first AI agent
+ 
+-A multi-model AI assistant that **does things**: it searches live job boards, the web and your past chats, checks the weather, reads pages and attached files (PDF, Word, images, code), and remembers your preferences, projects and decisions across conversations. You control which lookups run automatically and which ask first. Built with Next.js (App Router) and the OpenRouter API.
++Nimbus is a multi-model AI assistant that **takes actions**: it searches live job boards, the web and your past chats, checks the weather, reads pages and attached files (PDF, Word, images, code), and remembers your preferences, projects and decisions across conversations. It's built with Next.js, React and OpenRouter, and ships as a Windows desktop app (Electron) as well as a hosted demo.
+ 
+-**Live demo:** https://getnimbus.vercel.app/
++**Live demo:** https://getnimbus.vercel.app/ · **Author:** [John Bass](https://johnbass.dev)
++
++## For reviewers: what to look at
++
++Nimbus is not a chat UI wrapped around one API call. The interesting engineering is on the server:
++
++| What | Where | Why it matters |
++|---|---|---|
++| Agent loop with hard limits | `lib/nimbus/agent.mjs` | Model ⇄ tool loop capped at 6 steps, 10 tool calls and 90 s per turn, with per-tool timeouts. Limits are enforced in code, not requested in the prompt |
++| Tool safety gates | `agent.mjs`, `tools/` | Schema-validated arguments, permission prompts, confirm-before-destructive, and memory writes blocked after untrusted web content enters the turn (stops prompt-injected pages from planting memories) |
++| Honest failure reporting | `agent.mjs`, `llm.mjs` | Tool and provider failures go back to the model as errors to report, retryable errors (429/5xx) are retried, and replies claiming an action no tool performed get a visible warning |
++| Persistent memory | `lib/nimbus/memory-store.mjs` | Per-user JSON store with atomic writes, per-file write queues, supersede-on-correction, "don't remember X" blocks and secret refusal |
++| Request hygiene | `lib/nimbus/request.mjs` | Size limits, image allowlist, model allowlist, per-IP rate limiting. The API key never leaves the server |
++| SSRF guard | `lib/nimbus/net.mjs` | Outbound fetches refuse localhost and private/link-local addresses on every redirect hop |
++| Desktop packaging | `electron.js` | A bundled Next.js standalone server bound to loopback only, with links opened in the system browser |
++| Tests | `tests/`, `scripts/` | 81 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
++
++### Desktop app vs. hosted demo
++
++Nimbus is **desktop-first**. The desktop app runs its own local server, so long-term memory lives on your machine (in the app's user-data folder), not on a hosted service. The Vercel demo shows the chat, model switching, tools and streaming, but serverless functions have no persistent disk. Treat long-term memory as a desktop feature: the demo existing doesn't mean every desktop capability works there.
+ 
+ ## Features
+ 
+@@ -15,8 +34,7 @@ A multi-model AI assistant that **does things**: it searches live job boards, th
+ - **Permissions** — like ChatGPT and Claude, everyday lookups (web search, reading pages, weather, job search) run automatically by default, while searching your past chats asks first. Anything set to ask shows exactly what it wants to run (e.g. *Search your past chats for "affirm"*) with **Allow once**, **Always allow** or **Deny**. Change any of them in the **🔐 Permissions** panel
+ - **Persistent memory** — preferences, profile facts, project decisions and open tasks survive new chats and restarts. Only relevant memories go into each prompt, corrections replace old values, "don't remember X" is enforced, and secrets are refused. A **Memory panel** lets you view, edit and delete everything
+ - **Honest activity trail** — every reply shows the tools that actually ran and the memories it used. Replies that claim an action no tool performed get flagged automatically
+-
+-- **Live token streaming** — responses render word-by-word via a server-side streaming proxy (Edge-style `ReadableStream` over SSE)
++- **Live token streaming** — the server reads OpenRouter's SSE stream and re-emits newline-delimited JSON events (tokens plus tool activity) through a `ReadableStream`, so replies render word-by-word
+ - **Multi-model switching** — swap between DeepSeek V3.2, Gemma 4 31B, Llama 3.3 70B and Ministral 8B mid-conversation; the model allowlist is validated server-side
+ - **Stop & regenerate** — cancel a response mid-stream (`AbortController` wired through to the upstream request) or regenerate the last reply
+ - **Markdown rendering** — custom zero-dependency renderer with fenced code blocks, copy-to-clipboard, inline code, lists, headings, and links
+@@ -29,52 +47,110 @@ A multi-model AI assistant that **does things**: it searches live job boards, th
+ 
+ ```
+ app/page.jsx ──POST /api/OpenRouter──▶ route.js ──▶ lib/nimbus/agent.mjs
+-   ▲  NDJSON events (token, tool_start/end,          │  intent.mjs      classify, force first tool
+-   │  memory, notice, confirm, permission, done)     │  permissions.mjs defaults + ask / allow once / always allow
+-   │                                                 │  memory-store    retrieve relevant memories
+-   └─────────────────────────────────────────────────┤  llm.mjs         OpenRouter stream + tool calls
+-                                                     └─ tools/          search_jobs · web_search · fetch_url · search_chats · get_weather
+-app/components/MemoryPanel.jsx ──/api/memory──▶ memory-store       search/save/update/forget memory
++   ▲  NDJSON events (token, tool_start/end,   │      │  intent.mjs      classify, force first tool
++   │  memory, notice, confirm, permission,    │      │  permissions.mjs defaults + ask / allow once / always allow
++   │  done)                                   │      │  memory-store    retrieve relevant memories
++   └──────────────────────────────────────────┼──────┤  llm.mjs         OpenRouter stream + tool calls
++                               request.mjs ◀──┘      └─ tools/          search_jobs · web_search · fetch_url · search_chats · get_weather · memory tools
++                               limits · rate limit · model allowlist
++app/components/MemoryPanel.jsx ──/api/memory──▶ memory-store       view/edit/delete memory (same-origin only)
+ lib/ui/attachments.mjs ──/api/extract──▶ lib/nimbus/extract.mjs    PDF/Word → text (text files & images handled in the browser)
+ app/components/PermissionsPanel.jsx                                which lookups run without asking (localStorage)
++electron.js ──spawns──▶ .next/standalone/server.js on 127.0.0.1:3000
++```
++
++### One turn, step by step
++
++```mermaid
++flowchart TD
++    A[User message] --> B[route.js: validate size, images, model allowlist, rate limit]
++    B --> C[intent.mjs: classify request, maybe force a first tool]
++    C --> D[memory-store: retrieve up to 6 relevant memories]
++    D --> E[Call model via OpenRouter, streaming]
++    E -->|tool calls| F{{For each call}}
++    F --> G[Validate args against schema]
++    G --> H{{Permission / confirmation needed?}}
++    H -->|yes| I[Stop the turn and show a prompt]
++    H -->|no| J[Run tool with timeout, result fed back to the model]
++    J --> K{{Step, call or time limit reached?}}
++    K -->|no| E
++    K -->|yes| L[Final call with tools disabled]
++    E -->|text only| M[Check reply for unbacked claims]
++    L --> M
++    M --> N[Stream done event + content-free metrics]
+ ```
+ 
++Every step emits NDJSON events, so the UI shows which tools actually ran, which memories were used and any notices, as they happen.
++
++### Where state lives
++
+ | Concept | Where it lives |
+ |---|---|
+ | Conversation history | Browser localStorage. The current chat is sent with each request; other chats are sent (size-capped) only for replies where past-chat search is allowed |
+ | Attachments | Stored with the chat in localStorage. File text is sent inside `<attached_file>` tags; images as data URLs (if storage fills up, image data is dropped from the saved copy and the chip says "image not saved") |
+ | Search permissions | Browser localStorage (`searchPermissions.v2`), sent with each request. Defaults: web, weather and jobs allowed; past chats ask |
+-| Persistent memory | `NIMBUS_DATA_DIR/memory/<sha256(user token)>.json` on the server |
++| Persistent memory | `NIMBUS_DATA_DIR/memory/<sha256(user token)>.json` on the local server (the desktop app's user-data folder) |
+ | Current task context | The agent loop's message list for one turn (tool calls and results) |
+ | Project knowledge | Memories with `category: project/decision` and a `project` name |
+ 
++**Memory retrieval** is lexical: tokenization, light stemming and a small synonym map ("roles" ↔ "jobs"), with a relevance threshold so unrelated memories stay out of the prompt. It needs no embeddings service and costs nothing per query. Job searches always include saved job preferences, even when the message shares no words with them.
++
+ **Identity and privacy.** Each browser gets a random 256-bit token in an HttpOnly, SameSite=Strict cookie. Memory files are named by the token's SHA-256, so the token itself is never stored. There is no parameter anywhere that selects another user's memory. The store refuses API keys, passwords, SSNs and card numbers.
+ 
+-**Safety rules enforced in code, not just in the prompt:**
++## Failure handling
+ 
+-- Arguments are validated against each tool's schema. Bad JSON or bad fields go back to the model as errors so it can correct them.
+-- Each tool has a timeout, and each turn has a max of 6 steps, 10 tool calls and 90 seconds.
+-- Consequential tools (currently `forget_all_memories`) only run after you click **Confirm**.
+-- Lookup tools (`web_search`, `fetch_url`, `search_jobs`, `get_weather`, `search_chats`) only run when their permission is allowed. When one is needed without permission, nothing is fetched: the turn stops and shows the permission prompt instead of letting the model answer without the data. Web search and page reads share one permission so you aren't asked twice in one answer.
+-- Text inside an attached file is treated as data, not instructions: it's left out of intent routing, and memory writes are blocked on turns with attached files unless your own words asked for a memory change, the same guard used for web pages.
+-- Memory writes are blocked once web or job content has entered the turn, unless your own message asked for a memory change. This stops prompt-injected pages from planting memories.
+-- Outbound fetches block localhost, private and link-local addresses on every redirect hop.
+-- Job-board responses are cached for 2 hours to respect provider rate limits. Remotive asks for only a few calls per day.
++What happens when something goes wrong:
+ 
+-**Storage choice.** Memory uses JSON files with atomic writes and per-user write queues, so there's no native module to rebuild for Electron and no hosted database. That's right for the desktop app and single-instance hosting. On Vercel the filesystem is ephemeral, so memory won't persist there. Point `NIMBUS_DATA_DIR` at a persistent volume, or swap `memory-store.mjs` for a database adapter.
++| Failure | Behavior |
++|---|---|
++| Model provider returns 429 / 5xx or is unreachable | Retried up to twice with backoff, then a clear error |
++| Model route doesn't support tool calling | Detected from the error, retried as plain chat, with a notice in the reply |
++| Tool throws or times out | The error goes back to the model with "tell the user honestly, do not fabricate results"; the activity trail shows the failure |
++| Model sends malformed or invalid tool arguments | Rejected by the schema validator and returned to the model to correct |
++| Model loops on tools | Step, tool-call and wall-clock limits force a final answer with tools disabled; identical repeat calls are served from a per-turn cache |
++| Some job boards fail | Results from the others are returned, and the failure is reported |
++| Memory store unavailable or file corrupt | The model is told memory is unavailable (it doesn't invent memories); a corrupt file is quarantined, not fatal |
++| User hits Stop | `AbortController` cancels the upstream request and any running tool |
++| Reply claims "I saved / searched / applied" with no matching tool run | A visible warning is appended to the reply |
++| Desktop server fails to start | Error dialog instead of a blank window |
++
++## Security
++
++- **API key stays server-side.** The browser only talks to `/api/OpenRouter`; the key is read from the environment on the server.
++- **Constrained requests** (`lib/nimbus/request.mjs`): at most 60 messages, 100,000 chars per message (attached file text included), 200,000 chars total, and 4 images per message (~3 MB each, PNG/JPEG/WebP/GIF data URLs only). Model choice is checked against an allowlist shared with the client (`app/config/models.js`), so a client can't route requests to an arbitrary paid model.
++- **Rate limiting:** a per-IP sliding window (20 requests/minute) protects a public deployment from credit-burning abuse.
++- **Tool permissions and confirmation:** lookups run only when their permission group is allowed; `forget_all_memories` requires clicking **Confirm**.
++- **Prompt-injection containment:** text from web pages, job listings and attached files is marked as untrusted data, kept out of intent routing, and can't trigger memory writes unless your own words asked for one.
++- **SSRF protection:** `fetch_url` and the other outbound fetches resolve DNS and refuse loopback, private and link-local addresses, including on redirects.
++- **Memory API:** per-user, refuses cross-site writes (on top of a SameSite=Strict cookie), and rejects secrets.
++- **Desktop:** the bundled server listens on `127.0.0.1` only (Next's standalone default of `0.0.0.0` would expose the API to the local network). Links open in the system browser and only for `http`, `https` and `mailto`. The window can't be navigated away from the app.
++
++## Engineering trade-offs
++
++Choices that fit a single-user desktop app, and what I'd change at scale:
++
++| Today | Why | At scale |
++|---|---|---|
++| JSON-file memory store | No native modules to rebuild for Electron, no hosted DB, easy to inspect | A database adapter (Postgres/SQLite) behind the same `memory-store` interface |
++| Lexical memory retrieval | Free, fast, deterministic and testable | Embeddings + vector search for fuzzier recall, keeping the threshold and "always include" rules |
++| In-memory rate limiter | Correct for one process | A shared store (Redis/Upstash) across instances |
++| Chats in browser localStorage | Private and zero-backend | Server-side chat storage with accounts and sync |
++| Cookie-based anonymous identity | No sign-up needed | Real authentication, with memory keyed to the account |
++| Free-tier search and job APIs | Keeps running costs near zero | Paid search APIs with SLAs, plus a job-data provider |
++| OpenRouter key bundled in the personal desktop build | Simplest setup for my own machine | Ask for the key on first launch and store it in the OS keychain before distributing an installer |
+ 
+ ## Testing
+ 
+ ```bash
+-npm test               # 69 automated tests, mocked LLM + mocked HTTP
++npm test               # 81 automated tests, mocked LLM + mocked HTTP
+ npm run build && node scripts/smoke-server.mjs   # real built server + mock LLM over HTTP
+ npm run eval           # LIVE: real model, real job boards, real web (uses OPENROUTER_KEY)
+ npm run metrics        # summarise per-turn metrics logged by the app
+ ```
+ 
+-- `npm test` covers intent routing (with an accuracy figure), tool selection and execution, multistep tasks, malformed tool calls, unknown tools, timeouts, API failures, partial provider outages, step limits, no-tool models, confirmation gating, search permissions (ask / allow once / always allow, per group), search filters for each provider, past-chat search, weather (place matching, units, unknown places), attachments (file blocks, images as content parts, PDF extraction, injection via attached files), syntax highlighting, prompt-injection memory writes, unbacked-claim detection, SSRF and the 10 required memory behaviors. Restart persistence is tested in a separate Node process.
++- `npm test` covers intent routing (with an accuracy figure), tool selection and execution, multistep tasks, malformed tool calls, unknown tools, timeouts, API failures, partial provider outages, step and wall-clock limits, duplicate tool calls, no-tool models, confirmation gating, search permissions (ask / allow once / always allow, per group), search filters for each provider, past-chat search, weather, attachments (including injection via attached files), request validation, rate limiting, the model allowlist, syntax highlighting, prompt-injection memory writes, unbacked-claim detection, SSRF and 10 required memory behaviors. Restart persistence is tested in a separate Node process.
+ - The smoke test runs the **built** app: NDJSON streaming, cookies, per-user isolation, memory surviving a full server restart, and the memory API (edit, delete, cross-site refusal, secret rejection).
+-- These are **simulated**. Only `npm run eval` proves real end-to-end behavior. It reports task completion, tool-selection accuracy, link grounding (every URL in an answer must come from a tool result), needless clarifying questions and latency, and saves the results to `.nimbus-data/eval/`.
++- These tests are **simulated**. Only `npm run eval` proves real end-to-end behavior. It reports task completion, tool-selection accuracy, link grounding (every URL in an answer must come from a tool result), needless clarifying questions and latency, and saves the results to `.nimbus-data/eval/`.
+ 
+ ## Configuration
+ 
+@@ -111,24 +187,13 @@ Next.js · React · Tailwind CSS · OpenRouter API (streaming + tool calling) ·
+ 
+ Open [http://localhost:3000](http://localhost:3000).
+ 
+-## Architecture Notes
+-
+-The browser never sees the API key — all model calls go through `app/api/OpenRouter/route.js`, which validates the requested model against an allowlist (shared with the client via `app/config/models.js`, so the two never drift apart), forwards the conversation upstream, and runs the agent loop, streaming newline-delimited JSON events (tokens plus tool activity) back to the client. The client reads the stream with `response.body.getReader()` and updates React state per event, using functional state updaters to avoid stale-closure bugs during rapid streaming updates.
+-
+-The API route also guards against abuse and misconfiguration:
+-
+-- Fails fast with a clear error if `OPENROUTER_KEY` is missing, instead of an opaque upstream 502.
+-- Caps conversation size (60 messages / 100,000 chars per message including attached file text / 200,000 chars total / 4 images per message, about 3 MB each) before forwarding upstream. Image data URLs are checked against an allowlist of image types.
+-- Routes messages that contain images to a vision-capable model when the selected one isn't (`vision: true` in `app/config/models.js`).
+-- Applies a per-IP sliding-window rate limit (20 requests/minute) to protect against credit-burning abuse on a public deployment. It's in-memory and process-local — fine for a single instance, swap in Redis/Upstash if you scale horizontally.
+-
+ ## Desktop App (Electron)
+ 
+-`electron.js` wraps the app in a desktop shell. Because the app relies on server-side API routes (not just static pages), it can't use a static export — instead, production builds bundle a self-contained Next.js server (`output: "standalone"` in `next.config.ts`) that Electron spawns locally and points the window at.
++`electron.js` wraps the app in a desktop shell. The app relies on server-side API routes, so it can't use a static export. Instead, production builds bundle a self-contained Next.js server (`output: "standalone"` in `next.config.ts`). Electron spawns that server on `127.0.0.1:3000`, stores memory in the app's user-data folder (`NIMBUS_DATA_DIR`) so it survives updates, and points the window at it. It also stops a stale Nimbus server left on the port, and shows an error dialog if the server doesn't start.
+ 
+ ```bash
+ npm run electron        # dev: launches Electron against `next dev`
+-npm run electron:dist    # prod: builds Next.js + packages with electron-builder
++npm run electron:dist   # prod: builds Next.js + packages with electron-builder
+ ```
+ 
+ The desktop app adds a native right-click menu: **Copy**, **Share** and **Select All** on selected text; **Undo**, **Cut**, **Copy**, **Paste** and **Select All** in the message box; **Open Link in Browser** and **Copy Link** on links. Share uses the native share sheet on macOS; on Windows and Linux it offers **Email…** and **Search the web**, since Electron has no native share sheet there.
+-- 
+2.43.0
+
