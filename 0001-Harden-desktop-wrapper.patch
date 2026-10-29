@@ -1,0 +1,132 @@
+From a320e6d98df88974811c64b339368b40472ddd9e Mon Sep 17 00:00:00 2001
+From: John Bass <bassjohn159@yahoo.com>
+Date: Thu, 29 Oct 2026 14:15:33 -0500
+Subject: [PATCH] Harden desktop wrapper: loopback-only server, external links,
+ startup error
+
+- Bind the packaged Next server to 127.0.0.1 (standalone defaults to 0.0.0.0,
+  exposing the API and OpenRouter key to the local network)
+- Open links in the system browser (http/https/mailto only); block in-window navigation
+- Show an error dialog instead of a blank window if the server fails to start
+- Fix lint (ignore CommonJS afterPack hook) and stale OpenRouter referer URL
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019rgcayND8hS81m8p7pEv6W
+---
+ electron.js        | 35 +++++++++++++++++++++++++++++++++--
+ eslint.config.mjs  |  1 +
+ lib/nimbus/llm.mjs |  2 +-
+ 3 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/electron.js b/electron.js
+index 241f8cf..3762750 100644
+--- a/electron.js
++++ b/electron.js
+@@ -45,6 +45,8 @@ function stopStaleNimbusServer(port) {
+ }
+ let win = null;
+ 
++// Probe 127.0.0.1 directly: "localhost" can resolve to ::1 first, and the
++// server only listens on IPv4 loopback.
+ function waitForServer(url, timeoutMs = 15000) {
+   const start = Date.now();
+   return new Promise((resolve, reject) => {
+@@ -75,6 +77,9 @@ function startStandaloneServer(port) {
+       ...process.env,
+       ELECTRON_RUN_AS_NODE: "1",
+       PORT: String(port),
++      // Next's standalone server defaults to 0.0.0.0, which would expose the
++      // API (and the OpenRouter key behind it) to everyone on the same network.
++      HOSTNAME: "127.0.0.1",
+       NODE_ENV: "production",
+       // Persistent memory must live in a writable per-user location, not in
+       // the (possibly read-only) install directory, and must survive updates.
+@@ -87,6 +92,28 @@ function startStandaloneServer(port) {
+   });
+ }
+ 
++/* Links (including ones the model writes) open in the system browser, never
++   inside the Nimbus window, and only for web/mail schemes. */
++function isSafeExternal(url) {
++  try {
++    return ["http:", "https:", "mailto:"].includes(new URL(url).protocol);
++  } catch {
++    return false;
++  }
++}
++
++function lockNavigation(window, appOrigin) {
++  window.webContents.setWindowOpenHandler(({ url }) => {
++    if (isSafeExternal(url)) shell.openExternal(url);
++    return { action: "deny" };
++  });
++  window.webContents.on("will-navigate", (event, url) => {
++    if (new URL(url).origin === appOrigin) return;
++    event.preventDefault();
++    if (isSafeExternal(url)) shell.openExternal(url);
++  });
++}
++
+ /* Right-click menu. Electron windows have none by default, so right-clicking
+    selected text or the message box did nothing. Uses built-in roles so the OS
+    handles the clipboard, and only shows actions that apply to what was clicked. */
+@@ -135,7 +162,7 @@ function attachContextMenu(window) {
+     if (linkURL) {
+       if (items.length) items.push({ type: "separator" });
+       items.push(
+-        { label: "Open Link in Browser", click: () => shell.openExternal(linkURL) },
++        { label: "Open Link in Browser", enabled: isSafeExternal(linkURL), click: () => shell.openExternal(linkURL) },
+         { label: "Copy Link", click: () => clipboard.writeText(linkURL) }
+       );
+     }
+@@ -150,6 +177,7 @@ async function createWindow() {
+ 
+   win = new BrowserWindow({ width: 1200, height: 800, title: `Nimbus ${app.getVersion()}` });
+   attachContextMenu(win);
++  lockNavigation(win, `http://localhost:${PORT}`);
+   // Keep the version in the title bar so it's obvious which build is running.
+   win.on("page-title-updated", (event, title) => {
+     event.preventDefault();
+@@ -176,10 +204,13 @@ async function createWindow() {
+   }
+   startStandaloneServer(PORT);
+   try {
+-    await waitForServer(url);
++    await waitForServer(`http://127.0.0.1:${PORT}`);
+     win.loadURL(url);
+   } catch (err) {
+     console.error(err);
++    // Without this the user just gets a blank window and no explanation.
++    dialog.showErrorBox("Nimbus can't start", `The local Nimbus server didn't start within 15 seconds.\n\n${err.message}\n\nTry closing Nimbus and opening it again.`);
++    app.quit();
+   }
+ }
+ 
+diff --git a/eslint.config.mjs b/eslint.config.mjs
+index 1a75e9e..4f1c0c3 100644
+--- a/eslint.config.mjs
++++ b/eslint.config.mjs
+@@ -11,6 +11,7 @@ const eslintConfig = defineConfig([
+     "build/**",
+     "next-env.d.ts",
+     "electron.js",
++    "scripts/afterPack.js", // CommonJS hook loaded by electron-builder
+   ]),
+ ]);
+ 
+diff --git a/lib/nimbus/llm.mjs b/lib/nimbus/llm.mjs
+index ccd4916..7c09b08 100644
+--- a/lib/nimbus/llm.mjs
++++ b/lib/nimbus/llm.mjs
+@@ -18,7 +18,7 @@ export function isToolUnsupportedError(err) {
+   return (err.status === 400 || err.status === 404) && /tool|function/.test(b);
+ }
+ 
+-export function createOpenRouterClient({ apiKey, fetchImpl = fetch, baseUrl = "https://openrouter.ai/api/v1", referer = "https://deep-seek-clone-wine.vercel.app", title = "Nimbus AI" } = {}) {
++export function createOpenRouterClient({ apiKey, fetchImpl = fetch, baseUrl = "https://openrouter.ai/api/v1", referer = "https://getnimbus.vercel.app", title = "Nimbus AI" } = {}) {
+   return {
+     /**
+      * @returns {Promise<{content: string, toolCalls: {id,name,arguments}[], finishReason: string|null}>}
+-- 
+2.43.0
+
