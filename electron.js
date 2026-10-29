@@ -45,6 +45,8 @@ function stopStaleNimbusServer(port) {
 }
 let win = null;
 
+// Probe 127.0.0.1 directly: "localhost" can resolve to ::1 first, and the
+// server only listens on IPv4 loopback.
 function waitForServer(url, timeoutMs = 15000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
@@ -75,6 +77,9 @@ function startStandaloneServer(port) {
       ...process.env,
       ELECTRON_RUN_AS_NODE: "1",
       PORT: String(port),
+      // Next's standalone server defaults to 0.0.0.0, which would expose the
+      // API (and the OpenRouter key behind it) to everyone on the same network.
+      HOSTNAME: "127.0.0.1",
       NODE_ENV: "production",
       // Persistent memory must live in a writable per-user location, not in
       // the (possibly read-only) install directory, and must survive updates.
@@ -84,6 +89,28 @@ function startStandaloneServer(port) {
   });
   serverProcess.on("exit", (code) => {
     if (code !== 0) console.error(`Standalone server exited with code ${code}`);
+  });
+}
+
+/* Links (including ones the model writes) open in the system browser, never
+   inside the Nimbus window, and only for web/mail schemes. */
+function isSafeExternal(url) {
+  try {
+    return ["http:", "https:", "mailto:"].includes(new URL(url).protocol);
+  } catch {
+    return false;
+  }
+}
+
+function lockNavigation(window, appOrigin) {
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    if (isSafeExternal(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
+  window.webContents.on("will-navigate", (event, url) => {
+    if (new URL(url).origin === appOrigin) return;
+    event.preventDefault();
+    if (isSafeExternal(url)) shell.openExternal(url);
   });
 }
 
@@ -135,7 +162,7 @@ function attachContextMenu(window) {
     if (linkURL) {
       if (items.length) items.push({ type: "separator" });
       items.push(
-        { label: "Open Link in Browser", click: () => shell.openExternal(linkURL) },
+        { label: "Open Link in Browser", enabled: isSafeExternal(linkURL), click: () => shell.openExternal(linkURL) },
         { label: "Copy Link", click: () => clipboard.writeText(linkURL) }
       );
     }
@@ -150,6 +177,7 @@ async function createWindow() {
 
   win = new BrowserWindow({ width: 1200, height: 800, title: `Nimbus ${app.getVersion()}` });
   attachContextMenu(win);
+  lockNavigation(win, `http://localhost:${PORT}`);
   // Keep the version in the title bar so it's obvious which build is running.
   win.on("page-title-updated", (event, title) => {
     event.preventDefault();
@@ -176,10 +204,13 @@ async function createWindow() {
   }
   startStandaloneServer(PORT);
   try {
-    await waitForServer(url);
+    await waitForServer(`http://127.0.0.1:${PORT}`);
     win.loadURL(url);
   } catch (err) {
     console.error(err);
+    // Without this the user just gets a blank window and no explanation.
+    dialog.showErrorBox("Nimbus can't start", `The local Nimbus server didn't start within 15 seconds.\n\n${err.message}\n\nTry closing Nimbus and opening it again.`);
+    app.quit();
   }
 }
 

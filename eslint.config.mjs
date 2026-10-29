@@ -11,6 +11,7 @@ const eslintConfig = defineConfig([
     "build/**",
     "next-env.d.ts",
     "electron.js",
+    "scripts/afterPack.js", // CommonJS hook loaded by electron-builder
   ]),
 ]);
 
