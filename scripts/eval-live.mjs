@@ -3,7 +3,11 @@
 //
 //   npm run eval                       (uses OPENROUTER_KEY from .env.local)
 //   npm run eval -- --model llama-3.3-70b
-//   npm run eval -- --only job
+//   npm run eval -- --only job        (a group: job, research, chat, memory, sports, date,
+//                                      context, failure; or a single scenario id)
+//
+// A full run is compared with the previous full run of the same model and
+// prints any scenario that went from pass to fail (regression).
 //
 // For each scenario it measures: did the expected tool run, did the task
 // complete, is every link in the answer grounded in a tool result, did the
@@ -17,6 +21,7 @@ import { runAgent } from "../lib/nimbus/agent.mjs";
 import { createOpenRouterClient } from "../lib/nimbus/llm.mjs";
 import { createMemoryStore } from "../lib/nimbus/memory-store.mjs";
 import { DEFAULT_TOOLS } from "../lib/nimbus/tools/index.mjs";
+import { leakedToolSyntax, excessiveRepeats, mentionsDate, admitsFailure, compareRuns } from "../lib/nimbus/evalchecks.mjs";
 
 // app/config/models.js is ESM in a CommonJS package; Node ≥ 22 detects that.
 let MODELS = { "deepseek-v3.2": { upstream: "deepseek/deepseek-v3.2" } };
@@ -39,14 +44,17 @@ if (!process.env.OPENROUTER_KEY) {
 
 // Capture every URL that tools actually returned, for grounding checks.
 const seenUrls = new Set();
-const tools = DEFAULT_TOOLS.map((t) => ({
-  ...t,
-  async run(args, ctx) {
-    const out = await t.run(args, ctx);
-    for (const m of JSON.stringify(out).matchAll(/https?:\/\/[^\s"\\)]+/g)) seenUrls.add(m[0].replace(/[.,]+$/, ""));
-    return out;
-  },
-}));
+// `broken` simulates an outage: those tools throw, to test recovery and honesty.
+const toolsFor = (broken = []) =>
+  DEFAULT_TOOLS.map((t) => ({
+    ...t,
+    async run(args, ctx) {
+      if (broken.includes(t.name)) throw new Error("simulated outage");
+      const out = await t.run(args, ctx);
+      for (const m of JSON.stringify(out).matchAll(/https?:\/\/[^\s"\\)]+/g)) seenUrls.add(m[0].replace(/[.,]+$/, ""));
+      return out;
+    },
+  }));
 
 const SCENARIOS = [
   { id: "job-bare", group: "job", turns: ["job search"], expectTool: "search_jobs", expectLinks: true },
@@ -55,6 +63,19 @@ const SCENARIOS = [
   { id: "research-current", group: "research", turns: ["What's the latest stable version of Next.js?"], expectTool: "web_search", expectLinks: true },
   { id: "chat-knowledge", group: "chat", turns: ["Explain JavaScript closures with a short example"], expectTool: null },
   { id: "code-fix", group: "chat", turns: ["Fix this bug: `const total = items.reduce((a, b) => a + b.price)` returns '[object Object]10' "], expectTool: null },
+  // Regression: models used to loop on sports scores, fail, and print raw tool syntax.
+  { id: "sports-nfl-scores", group: "sports", turns: ["What are the latest NFL scores?"], expectTool: "web_search", check: (r) => r.links.length > 0 || admitsFailure(r.text) },
+  { id: "sports-nfl-reworded", group: "sports", turns: ["Who won the most recent Dallas Cowboys game and what was the score?"], expectTool: "web_search", check: (r) => r.links.length > 0 || admitsFailure(r.text) },
+  { id: "date-today", group: "date", turns: ["What's today's date?"], expectTool: null, check: (r) => mentionsDate(r.text, new Date()) },
+  { id: "date-relative", group: "date", turns: ["What day of the week will it be 10 days from today? Give the date too."], expectTool: null, check: (r) => {
+    const d = new Date(Date.now() + 10 * 864e5);
+    return mentionsDate(r.text, d) && new RegExp(d.toLocaleDateString("en-US", { weekday: "long" }), "i").test(r.text);
+  } },
+  { id: "job-filters-strict", group: "job", turns: ["Find remote Python jobs paying at least $90k"], expectTool: "search_jobs", expectLinks: true, check: (r) => r.toolArgs.search_jobs?.min_salary >= 90000 && r.toolArgs.search_jobs?.remote_only === true },
+  { id: "context-retention", group: "context", turns: ["I'm building an app called StoryForge with React Native.", "What's my app called, and what is it built with?"], expectTool: null, check: (r) => /storyforge/i.test(r.text) && /react native/i.test(r.text) },
+  // Outage: the tool fails every time. Must stop retrying, admit it, and invent no sources.
+  { id: "web-outage", group: "failure", turns: ["What's the latest stable version of Next.js?"], broken: ["web_search", "fetch_url"], expectTool: null, check: (r) => admitsFailure(r.text) && r.links.length === 0 },
+  { id: "jobs-outage", group: "failure", turns: ["job search"], broken: ["search_jobs"], expectTool: null, check: (r) => admitsFailure(r.text) && r.links.length === 0 },
   { id: "unsupported", group: "chat", turns: ["Submit my application to the Acme frontend job for me"], expectTool: null, check: (r) => !/\b(i('ve| have) (submitted|applied))\b/i.test(r.text) },
   {
     id: "memory-roundtrip", group: "memory",
@@ -98,7 +119,7 @@ for (const sc of SCENARIOS.filter((s) => !only || s.group === only || s.id === o
       const events = [];
       const t0 = Date.now();
       seenUrls.clear();
-      const { text, metrics } = await runAgent({ messages: history, model: upstream, userKey, store, llm, tools, emit: (e) => events.push(e), env: process.env });
+      const { text, metrics } = await runAgent({ messages: history, model: upstream, userKey, store, llm, tools: toolsFor(sc.broken), emit: (e) => events.push(e), env: process.env });
       const toolArgs = Object.fromEntries(events.filter((e) => e.type === "tool_start").map((e) => [e.name, e.args]));
       const links = [...text.matchAll(/\]\((https?:\/\/[^)\s]+)\)|(?<![(\w])(https?:\/\/[^\s)>\]]+)/g)].map((m) => (m[1] ?? m[2]).replace(/[.,]+$/, ""));
       const ungrounded = links.filter((u) => ![...seenUrls].some((s) => s === u || s.startsWith(u) || u.startsWith(s)));
@@ -112,8 +133,12 @@ for (const sc of SCENARIOS.filter((s) => !only || s.group === only || s.id === o
     const grounded = last.ungrounded.length === 0;
     const extraOk = sc.check ? Boolean(sc.check(last, turnResults, store)) : true;
     const clarifiedNeedlessly = sc.expectTool && last.tools.length === 0 && /\?\s*$/.test(last.text.trim());
-    const pass = toolOk && linksOk && grounded && extraOk;
-    results.push({ id: sc.id, group: sc.group, pass, toolOk, linksOk, grounded, extraOk, clarifiedNeedlessly, ms: turnResults.reduce((a, t) => a + t.ms, 0), ungrounded: last.ungrounded, tools: turnResults.map((t) => t.tools), preview: last.text.slice(0, 400) });
+    // Checks that apply to every scenario, whatever it tests.
+    const clean = !turnResults.some((t) => leakedToolSyntax(t.text));
+    const noLoop = !turnResults.some((t) => excessiveRepeats(t.metrics.toolCalls));
+    const answered = turnResults.every((t) => t.text.trim().length > 0);
+    const pass = toolOk && linksOk && grounded && extraOk && clean && noLoop && answered;
+    results.push({ id: sc.id, group: sc.group, pass, toolOk, linksOk, grounded, extraOk, clean, noLoop, answered, clarifiedNeedlessly, ms: turnResults.reduce((a, t) => a + t.ms, 0), ungrounded: last.ungrounded, tools: turnResults.map((t) => t.tools), preview: last.text.slice(0, 400) });
     console.log(pass ? "PASS" : "FAIL", `(${(results.at(-1).ms / 1000).toFixed(1)}s)`);
   } catch (err) {
     results.push({ id: sc.id, group: sc.group, pass: false, error: err.message });
@@ -127,13 +152,38 @@ console.log(`\nModel: ${modelSlug} (${upstream})`);
 console.log(`Task completion:      ${pct("pass")}  (${results.filter((r) => r.pass).length}/${n})`);
 console.log(`Tool selection:       ${pct("toolOk")}`);
 console.log(`Factual grounding:    ${pct("grounded")}  (every link came from a tool result)`);
+console.log(`No leaked syntax:     ${pct("clean")}  (no raw tool-call text in replies)`);
+console.log(`No search loops:      ${pct("noLoop")}  (no tool called more than 4 times)`);
 console.log(`Needless clarifying:  ${results.filter((r) => r.clarifiedNeedlessly).length}`);
 console.log(`Median latency:       ${(results.map((r) => r.ms ?? 0).sort((a, b) => a - b)[Math.floor(n / 2)] / 1000).toFixed(1)}s`);
 for (const r of results.filter((x) => !x.pass)) console.log(`\n✗ ${r.id}: ${JSON.stringify({ ...r, preview: undefined })}\n  ${r.preview ?? ""}`);
 
 const out = path.join(process.cwd(), ".nimbus-data", "eval");
 await fs.mkdir(out, { recursive: true });
+
+// Compare with the previous full run of this model, so a fix that breaks
+// something else shows up as a regression instead of a vague "mostly passing".
+let regressions = [];
+if (!only) {
+  // Baseline = newest earlier FULL run (no --only) in which no scenario hit a provider error.
+  const prevFiles = (await fs.readdir(out)).filter((f) => f.startsWith(`eval-${modelSlug}-`) && f.endsWith(".json")).sort().reverse();
+  let prev = null;
+  for (const f of prevFiles) {
+    const candidate = JSON.parse(await fs.readFile(path.join(out, f), "utf8"));
+    if (candidate.full && !candidate.results.some((r) => r.error)) {
+      prev = candidate;
+      break;
+    }
+  }
+  if (prev) {
+    const diff = compareRuns(prev.results, results);
+    regressions = diff.regressions;
+    console.log(`\nvs previous run (${prev.at}): ${diff.regressions.length} regression(s), ${diff.fixed.length} fixed`);
+    if (diff.regressions.length) console.log(`  REGRESSED: ${diff.regressions.join(", ")}`);
+    if (diff.fixed.length) console.log(`  fixed:     ${diff.fixed.join(", ")}`);
+  }
+}
 const file = path.join(out, `eval-${modelSlug}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
-await fs.writeFile(file, JSON.stringify({ model: modelSlug, at: new Date().toISOString(), results }, null, 2));
+await fs.writeFile(file, JSON.stringify({ model: modelSlug, at: new Date().toISOString(), full: !only, results }, null, 2));
 console.log(`\nSaved: ${file}`);
-process.exit(results.every((r) => r.pass) ? 0 : 1);
+process.exit(results.every((r) => r.pass) && !regressions.length ? 0 : 1);

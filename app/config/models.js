@@ -13,18 +13,27 @@
 // working as individual free models come and go. Paid models draw from the
 // OpenRouter balance.
 
+// Routing metadata (used only by the "smart" router, lib/nimbus/router.mjs):
+//   paid: true       draws from the OpenRouter balance (otherwise free)
+//   longContext      comfortably handles long attached documents
+//   strengths        what the router may send to it: "code", "reasoning", "tools"
+// `smart` is a virtual entry: it has no upstream id. The API route resolves it
+// to a concrete model per request and falls back down the router's chain if
+// that model is unavailable.
 export const MODELS = {
   "free-router": { label: "Auto (free)", upstream: "openrouter/free", vision: true },
-  "llama-3.3-70b-free": { label: "Llama 3.3 70B (free)", upstream: "meta-llama/llama-3.3-70b-instruct:free" },
-  "deepseek-v3.2": { label: "DeepSeek V3.2", upstream: "deepseek/deepseek-v3.2" },
+  smart: { label: "Smart (auto-pick, may use low-cost paid models)", router: true },
+  "llama-3.3-70b-free": { label: "Llama 3.3 70B (free)", upstream: "meta-llama/llama-3.3-70b-instruct:free", longContext: true },
+  "deepseek-v3.2": { label: "DeepSeek V3.2", upstream: "deepseek/deepseek-v3.2", paid: true, longContext: true, strengths: ["code", "reasoning", "tools"] },
   "gemma-4-31b": { label: "Gemma 4 31B (free)", upstream: "google/gemma-4-31b-it:free", vision: true },
-  "llama-3.3-70b": { label: "Llama 3.3 70B", upstream: "meta-llama/llama-3.3-70b-instruct" },
-  "ministral-8b": { label: "Ministral 8B", upstream: "mistralai/ministral-8b-2512" },
+  "llama-3.3-70b": { label: "Llama 3.3 70B", upstream: "meta-llama/llama-3.3-70b-instruct", paid: true, longContext: true, strengths: ["tools"] },
+  "ministral-8b": { label: "Ministral 8B", upstream: "mistralai/ministral-8b-2512", paid: true },
 };
 
 export const DEFAULT_MODEL = "free-router";
 export const VISION_MODEL = "free-router";
 
 export function resolveUpstreamModel(slug) {
+  // Virtual entries (smart) have no upstream id; the route resolves them first.
   return MODELS[slug]?.upstream ?? MODELS[DEFAULT_MODEL].upstream;
 }

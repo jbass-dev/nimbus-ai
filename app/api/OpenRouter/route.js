@@ -1,5 +1,6 @@
 import { MODELS, VISION_MODEL, resolveUpstreamModel } from "../../config/models";
 import { validateMessages, sanitizeArchive, createRateLimiter, getClientIp, chooseModel } from "@/lib/nimbus/request.mjs";
+import { describeRequest, routeTask } from "@/lib/nimbus/router.mjs";
 import { runAgent } from "@/lib/nimbus/agent.mjs";
 import { createOpenRouterClient } from "@/lib/nimbus/llm.mjs";
 import { resolveIdentity } from "@/lib/nimbus/identity.mjs";
@@ -43,7 +44,15 @@ export async function POST(req) {
     const validationError = validateMessages(messages);
     if (validationError) return jsonError(validationError, 400, setCookie);
 
-    const { modelSlug, visionNotice, supportsTools } = chooseModel({ requested: model, messages, models: MODELS, visionModel: VISION_MODEL });
+    // "Smart" picks a concrete model for this request and a chain to fall back on.
+    let routing = null;
+    let requestedModel = model;
+    if (MODELS[model]?.router) {
+      routing = routeTask(describeRequest(messages), MODELS, { allowPaid: process.env.NIMBUS_SMART_FREE_ONLY !== "1" });
+      requestedModel = routing.chain[0];
+    }
+    const { modelSlug, visionNotice, supportsTools } = chooseModel({ requested: requestedModel, messages, models: MODELS, visionModel: VISION_MODEL });
+    const fallbackModels = (routing?.chain ?? []).slice(1).filter((s) => s !== modelSlug).map((s) => ({ upstream: resolveUpstreamModel(s), label: MODELS[s].label }));
     const upstreamModel = resolveUpstreamModel(modelSlug);
     const llm = createOpenRouterClient({
       apiKey: process.env.OPENROUTER_KEY,
@@ -64,6 +73,7 @@ export async function POST(req) {
           }
         };
         if (visionNotice) emit({ type: "notice", level: "info", text: visionNotice });
+        if (routing) emit({ type: "notice", level: "info", text: `Smart routing: ${MODELS[modelSlug].label} (${routing.reason}).` });
         try {
           const { metrics } = await runAgent({
             messages,
@@ -74,13 +84,14 @@ export async function POST(req) {
             emit,
             signal: req.signal,
             supportsTools,
+            fallbackModels,
             env: { BRAVE_API_KEY: process.env.BRAVE_API_KEY, TAVILY_API_KEY: process.env.TAVILY_API_KEY },
             confirmedActions: Array.isArray(confirmedActions) ? confirmedActions.filter((a) => typeof a === "string").slice(0, 5) : [],
             // Ask-every-time is the default: a missing permissions object means nothing is pre-allowed.
             permissions: normalizePermissions(permissions) ?? normalizePermissions({}),
             chatArchive: sanitizeArchive(chatArchive),
           });
-          logMetrics({ model: modelSlug ?? "default", ...metrics });
+          logMetrics({ model: modelSlug ?? "default", ...(routing ? { routedTask: routing.task } : {}), ...metrics });
         } catch (err) {
           if (err?.name !== "AbortError" && !req.signal.aborted) {
             console.error("agent error:", err);

@@ -17,7 +17,7 @@ Nimbus is not a chat UI wrapped around one API call. The interesting engineering
 | Request hygiene | `lib/nimbus/request.mjs` | Size limits, image allowlist, model allowlist, per-IP rate limiting. The API key never leaves the server |
 | SSRF guard | `lib/nimbus/net.mjs` | Outbound fetches refuse localhost and private/link-local addresses on every redirect hop |
 | Desktop packaging | `electron.js` | A bundled Next.js standalone server bound to loopback only, with links opened in the system browser |
-| Tests | `tests/`, `scripts/` | 92 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
+| Tests | `tests/`, `scripts/` | 119 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
 
 ### Desktop app vs. hosted demo
 
@@ -32,10 +32,12 @@ Nimbus is **desktop-first**. The desktop app runs its own local server, so long-
 - **Files & images** — attach with 📎, paste a screenshot, or drag files onto the message box (up to 5 per message, 10 MB each). Text and code files are read in the browser; PDFs and Word documents are extracted on the server (`/api/extract`, via `unpdf` and `mammoth`); long files are trimmed to 30,000 characters and the reply says so. Images are resized and sent to a vision model; if the selected model can't see images, the free router answers that message with a vision-capable model and a note says so
 - **Past-chat search** — `search_chats` finds where something came up in your other conversations ("what did we decide last time about…") and returns the chat title and matching excerpt
 - **Permissions** — like ChatGPT and Claude, everyday lookups (web search, reading pages, weather, job search) run automatically by default, while searching your past chats asks first. Anything set to ask shows exactly what it wants to run (e.g. *Search your past chats for "affirm"*) with **Allow once**, **Always allow** or **Deny**. Change any of them in the **🔐 Permissions** panel
+- **Layered memory** — recall is organised in three layers: **personal** (preferences, profile), **project** (facts, decisions, open tasks, keyed by project name) and **conversation** (takeaways worth carrying out of past chats). Mention a project ("make improvements to StoryForge") and its saved decisions and open tasks come back even when the wording doesn't overlap. Rarer words count for more than words most memories share, and no single layer can crowd out the others
 - **Persistent memory** — preferences, profile facts, project decisions and open tasks survive new chats and restarts. Only relevant memories go into each prompt, corrections replace old values, "don't remember X" is enforced, and secrets are refused. A **Memory panel** lets you view, edit and delete everything
 - **Honest activity trail** — every reply shows the tools that actually ran and the memories it used. Replies that claim an action no tool performed get flagged automatically
 - **Live token streaming** — the server reads OpenRouter's SSE stream and re-emits newline-delimited JSON events (tokens plus tool activity) through a `ReadableStream`, so replies render word-by-word
 - **Multi-model switching** — swap mid-conversation between free models (the default **Auto (free)** router, Llama 3.3 70B free, Gemma 4 31B free) and low-cost paid ones (DeepSeek V3.2, Llama 3.3 70B, Ministral 8B); the model allowlist is validated server-side
+- **Smart routing** — pick **Smart** and Nimbus chooses per message: short questions stay on free models, coding and reasoning go to a strong model, live lookups (web, jobs, URLs) to a reliable tool-caller, long documents to long-context models, images to vision models. Each pick comes with a fallback chain, so an out-of-credit (402), missing (404), overloaded (5xx) or rate-limited model moves to the next one with a notice instead of an error. Set `NIMBUS_SMART_FREE_ONLY=1` to keep Smart on free models
 - **Stop & regenerate** — cancel a response mid-stream (`AbortController` wired through to the upstream request) or regenerate the last reply
 - **Markdown rendering** — custom zero-dependency renderer with fenced code blocks, copy-to-clipboard, inline code, lists, headings, and links
 - **Syntax highlighting** — a small zero-dependency highlighter (`lib/ui/highlight.mjs`) colors code blocks for JS/TS, Python, shell/PowerShell, SQL, CSS, HTML, JSON and C-style languages (C, C++, C#, Java, Go, Rust…)
@@ -93,7 +95,7 @@ Every step emits NDJSON events, so the UI shows which tools actually ran, which 
 | Current task context | The agent loop's message list for one turn (tool calls and results) |
 | Project knowledge | Memories with `category: project/decision` and a `project` name |
 
-**Memory retrieval** is lexical: tokenization, light stemming and a small synonym map ("roles" ↔ "jobs"), with a relevance threshold so unrelated memories stay out of the prompt. It needs no embeddings service and costs nothing per query. Job searches always include saved job preferences, even when the message shares no words with them.
+**Memory retrieval** is lexical by default: tokenization, light stemming, a small synonym map ("roles" ↔ "jobs"), IDF weighting over your own memories, project-name matching and a per-layer cap, with a relevance threshold so unrelated memories stay out of the prompt. It needs no embeddings service and costs nothing per query. **Optional semantic recall:** set `NIMBUS_EMBEDDINGS_MODEL` to an OpenRouter embedding model id and memories also get a vector, so "my dog" finds "my puppy is named Biscuit". This sends memory text to the embeddings provider, so it is off by default; vectors are stored in your local memory file, never shown in the UI or prompt, and any embeddings failure falls back to lexical search. Job searches always include saved job preferences, even when the message shares no words with them.
 
 **Identity and privacy.** Each browser gets a random 256-bit token in an HttpOnly, SameSite=Strict cookie. Memory files are named by the token's SHA-256, so the token itself is never stored. There is no parameter anywhere that selects another user's memory. The store refuses API keys, passwords, SSNs and card numbers.
 
@@ -108,6 +110,7 @@ What happens when something goes wrong:
 | Tool throws or times out | The error goes back to the model with "tell the user honestly, do not fabricate results"; the activity trail shows the failure |
 | Model sends malformed or invalid tool arguments | Rejected by the schema validator and returned to the model to correct |
 | Model loops on tools | Step, tool-call and wall-clock limits force a final answer with tools disabled; identical repeat calls are served from a per-turn cache |
+| Chosen model is out of credit, gone, down or rate-limited (Smart routing) | Retried, then the next model in the router's chain answers, with a notice. A rejected API key is not retried elsewhere |
 | Model reruns near-identical searches, or a tool keeps failing or returning nothing | Reworded repeats (same filters, similar query) are skipped; a tool with 3 failed or empty results is cut off. Either way the tool phase ends and the model must answer with what it has |
 | Model writes a tool call as plain text (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`, bare JSON) | The markup is filtered out of the stream and the call is recovered and run like a structured one, so raw syntax never reaches the chat |
 | Model returns an empty reply | An honest "couldn't get a reliable answer" message replaces the blank bubble |
@@ -135,7 +138,7 @@ Choices that fit a single-user desktop app, and what I'd change at scale:
 | Today | Why | At scale |
 |---|---|---|
 | JSON-file memory store | No native modules to rebuild for Electron, no hosted DB, easy to inspect | A database adapter (Postgres/SQLite) behind the same `memory-store` interface |
-| Lexical memory retrieval | Free, fast, deterministic and testable | Embeddings + vector search for fuzzier recall, keeping the threshold and "always include" rules |
+| Lexical memory retrieval (embeddings opt-in) | Free, fast, deterministic and testable | A vector index instead of scanning every memory, keeping the threshold, layer and project rules |
 | In-memory rate limiter | Correct for one process | A shared store (Redis/Upstash) across instances |
 | Chats in browser localStorage | Private and zero-backend | Server-side chat storage with accounts and sync |
 | Cookie-based anonymous identity | No sign-up needed | Real authentication, with memory keyed to the account |
@@ -145,7 +148,7 @@ Choices that fit a single-user desktop app, and what I'd change at scale:
 ## Testing
 
 ```bash
-npm test               # 92 automated tests, mocked LLM + mocked HTTP
+npm test               # 119 automated tests, mocked LLM + mocked HTTP
 npm run build && node scripts/smoke-server.mjs   # real built server + mock LLM over HTTP
 npm run eval           # LIVE: real model, real job boards, real web (uses OPENROUTER_KEY)
 npm run metrics        # summarise per-turn metrics logged by the app
@@ -153,6 +156,7 @@ npm run metrics        # summarise per-turn metrics logged by the app
 
 - `npm test` covers intent routing (with an accuracy figure), tool selection and execution, multistep tasks, malformed tool calls, unknown tools, timeouts, API failures, partial provider outages, step and wall-clock limits, duplicate tool calls, no-tool models, confirmation gating, search permissions (ask / allow once / always allow, per group), search filters for each provider, past-chat search, weather, attachments (including injection via attached files), request validation, rate limiting, the model allowlist, syntax highlighting, prompt-injection memory writes, unbacked-claim detection, SSRF and 10 required memory behaviors. Restart persistence is tested in a separate Node process.
 - The smoke test runs the **built** app: NDJSON streaming, cookies, per-user isolation, memory surviving a full server restart, and the memory API (edit, delete, cross-site refusal, secret rejection).
+- `npm run eval` runs 19 live scenarios in eight groups (job, research, chat, memory, sports, date, context, failure). Beyond the per-scenario checks, **every** scenario must also produce a non-empty reply with no raw tool-call syntax and no tool called more than 4 times. Outage scenarios break a tool on purpose and require an honest failure message with no invented links. The sports scenarios are regression cases for the old NFL-scores loop. A full run is diffed against the previous clean full run of the same model and lists any scenario that went from pass to fail. Run one group with `npm run eval -- --only failure`. The checks themselves live in `lib/nimbus/evalchecks.mjs` and are unit-tested.
 - These tests are **simulated**. Only `npm run eval` proves real end-to-end behavior. It reports task completion, tool-selection accuracy, link grounding (every URL in an answer must come from a tool result), needless clarifying questions and latency, and saves the results to `.nimbus-data/eval/`.
 
 ## Configuration
@@ -161,6 +165,8 @@ npm run metrics        # summarise per-turn metrics logged by the app
 |---|---|
 | `OPENROUTER_KEY` | Required |
 | `BRAVE_API_KEY` / `TAVILY_API_KEY` | Optional. Better web search than the DuckDuckGo fallback (both have free tiers) |
+| `NIMBUS_EMBEDDINGS_MODEL` | Optional. OpenRouter embedding model id for semantic memory recall (sends memory text to that provider) |
+| `NIMBUS_SMART_FREE_ONLY=1` | Optional. Keeps the **Smart** router on free models |
 | `NIMBUS_DATA_DIR` | Where memory and metrics are stored. Default `./.nimbus-data`. Electron uses the app's user-data folder |
 | `NIMBUS_METRICS=off` | Disable per-turn metrics logging. Metrics never include message content |
 
