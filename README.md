@@ -17,7 +17,7 @@ Nimbus is not a chat UI wrapped around one API call. The interesting engineering
 | Request hygiene | `lib/nimbus/request.mjs` | Size limits, image allowlist, model allowlist, per-IP rate limiting. The API key never leaves the server |
 | SSRF guard | `lib/nimbus/net.mjs` | Outbound fetches refuse localhost and private/link-local addresses on every redirect hop |
 | Desktop packaging | `electron.js` | A bundled Next.js standalone server bound to loopback only, with links opened in the system browser |
-| Tests | `tests/`, `scripts/` | 81 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
+| Tests | `tests/`, `scripts/` | 92 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
 
 ### Desktop app vs. hosted demo
 
@@ -108,6 +108,9 @@ What happens when something goes wrong:
 | Tool throws or times out | The error goes back to the model with "tell the user honestly, do not fabricate results"; the activity trail shows the failure |
 | Model sends malformed or invalid tool arguments | Rejected by the schema validator and returned to the model to correct |
 | Model loops on tools | Step, tool-call and wall-clock limits force a final answer with tools disabled; identical repeat calls are served from a per-turn cache |
+| Model reruns near-identical searches, or a tool keeps failing or returning nothing | Reworded repeats (same filters, similar query) are skipped; a tool with 3 failed or empty results is cut off. Either way the tool phase ends and the model must answer with what it has |
+| Model writes a tool call as plain text (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`, bare JSON) | The markup is filtered out of the stream and the call is recovered and run like a structured one, so raw syntax never reaches the chat |
+| Model returns an empty reply | An honest "couldn't get a reliable answer" message replaces the blank bubble |
 | Some job boards fail | Results from the others are returned, and the failure is reported |
 | Memory store unavailable or file corrupt | The model is told memory is unavailable (it doesn't invent memories); a corrupt file is quarantined, not fatal |
 | User hits Stop | `AbortController` cancels the upstream request and any running tool |
@@ -142,7 +145,7 @@ Choices that fit a single-user desktop app, and what I'd change at scale:
 ## Testing
 
 ```bash
-npm test               # 81 automated tests, mocked LLM + mocked HTTP
+npm test               # 92 automated tests, mocked LLM + mocked HTTP
 npm run build && node scripts/smoke-server.mjs   # real built server + mock LLM over HTTP
 npm run eval           # LIVE: real model, real job boards, real web (uses OPENROUTER_KEY)
 npm run metrics        # summarise per-turn metrics logged by the app
