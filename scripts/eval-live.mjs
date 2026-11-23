@@ -21,7 +21,7 @@ import { runAgent } from "../lib/nimbus/agent.mjs";
 import { createOpenRouterClient } from "../lib/nimbus/llm.mjs";
 import { createMemoryStore } from "../lib/nimbus/memory-store.mjs";
 import { DEFAULT_TOOLS } from "../lib/nimbus/tools/index.mjs";
-import { leakedToolSyntax, excessiveRepeats, mentionsDate, admitsFailure, compareRuns } from "../lib/nimbus/evalchecks.mjs";
+import { leakedToolSyntax, excessiveRepeats, mentionsDate, admitsFailure, compareRuns, citationStats } from "../lib/nimbus/evalchecks.mjs";
 
 // app/config/models.js is ESM in a CommonJS package; Node ≥ 22 detects that.
 let MODELS = { "deepseek-v3.2": { upstream: "deepseek/deepseek-v3.2" } };
@@ -61,6 +61,12 @@ const SCENARIOS = [
   { id: "job-react-60k", group: "job", turns: ["Find remote React jobs paying at least $60k"], expectTool: "search_jobs", expectLinks: true, check: (r) => r.toolArgs.search_jobs?.min_salary >= 60000 },
   { id: "research-company", group: "research", turns: ["Research the company Vercel — what do they do and who is the CEO?"], expectTool: "web_search", expectLinks: true },
   { id: "research-current", group: "research", turns: ["What's the latest stable version of Next.js?"], expectTool: "web_search", expectLinks: true },
+  // Research Mode: one research call, then a synthesized report that cites distinct sources.
+  { id: "research-compare", group: "research", turns: ["Compare the latest AI coding assistants and determine which offers the best value."], expectTool: "research", expectLinks: true, check: (r) => {
+    const c = citationStats(r.text);
+    return c.markers >= 2 && c.domains >= 2 && r.metrics.toolCalls.filter((t) => t.name === "research").length === 1;
+  } },
+  { id: "research-history", group: "research", turns: ["Do deep research on which JavaScript test runner is best for a small project.", "NEW_CHAT", "What did we find earlier about JavaScript test runners?"], expectTool: "research_history", check: (r) => r.text.trim().length > 80 },
   { id: "chat-knowledge", group: "chat", turns: ["Explain JavaScript closures with a short example"], expectTool: null },
   { id: "code-fix", group: "chat", turns: ["Fix this bug: `const total = items.reduce((a, b) => a + b.price)` returns '[object Object]10' "], expectTool: null },
   // Regression: models used to loop on sports scores, fail, and print raw tool syntax.

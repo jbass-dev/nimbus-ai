@@ -81,6 +81,8 @@ function ActivityList({ activity }) {
   );
 }
 
+import ProposalCard from "./ProposalCard";
+
 export default function MessageBubble({
   message,
   isStreaming,
@@ -198,6 +200,8 @@ export default function MessageBubble({
             )}
           </div>
         )}
+
+        {!isUser && message.proposals?.map((p) => <ProposalCard key={p.id} proposal={p} />)}
 
         {!isUser && message.confirm && !message.confirm.resolved && !isStreaming && (
           <div className="mt-2 flex items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">

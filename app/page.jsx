@@ -8,6 +8,7 @@ import { DEFAULT_ALWAYS_ALLOW } from "@/lib/nimbus/permissions.mjs";
 import AttachmentChips from "./components/AttachmentChips";
 import { ACCEPT, MAX_ATTACHMENTS, readAttachment, toRequestMessage } from "@/lib/ui/attachments.mjs";
 import MemoryPanel from "./components/MemoryPanel";
+import WorkspacePanel from "./components/WorkspacePanel";
 import { MODELS, DEFAULT_MODEL } from "./config/models";
 
 const MAX_INPUT_LENGTH = 8000;
@@ -27,6 +28,12 @@ export default function Home() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [showMemory, setShowMemory] = useState(false);
+  const [showWorkspace, setShowWorkspace] = useState(false);
+  const [workspace, setWorkspace] = useState(null);
+  // Hidden unless the server says the coding workspace is on (desktop app only).
+  useEffect(() => {
+    fetch("/api/workspace").then((r) => r.json()).then(setWorkspace).catch(() => setWorkspace({ enabled: false }));
+  }, []);
   // True once saved state has been read, so the save effects can't
   // overwrite storage with the empty initial state on first render.
   const [loaded, setLoaded] = useState(false);
@@ -248,6 +255,9 @@ export default function Home() {
           break;
         case "permission":
           patchLastAssistant(chatId, { permission: { requests: event.requests ?? [] } });
+          break;
+        case "proposal":
+          patchLastAssistant(chatId, (m) => ({ proposals: [...(m.proposals ?? []), event.proposal] }));
           break;
         case "confirm":
           patchLastAssistant(chatId, { confirm: { actionId: event.actionId, prompt: event.prompt } });
@@ -662,6 +672,16 @@ export default function Home() {
           </div>
 
           <div className="flex items-center gap-2">
+          {workspace?.enabled && (
+            <button
+              type="button"
+              onClick={() => setShowWorkspace(true)}
+              className="px-3 py-1.5 rounded-lg border border-neutral-700 text-sm text-neutral-300 hover:text-white hover:border-indigo-500 transition-colors"
+              title="Open a project folder so Nimbus can read your code and suggest edits"
+            >
+              📁 {workspace?.name ?? "Project"}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setShowMemory(true)}
@@ -695,6 +715,7 @@ export default function Home() {
         </header>
 
         {showMemory && <MemoryPanel onClose={() => setShowMemory(false)} />}
+        {showWorkspace && <WorkspacePanel onClose={() => setShowWorkspace(false)} onChange={setWorkspace} />}
         {showPermissions && (
           <PermissionsPanel
             alwaysAllow={alwaysAllow}

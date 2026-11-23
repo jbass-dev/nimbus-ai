@@ -17,7 +17,7 @@ Nimbus is not a chat UI wrapped around one API call. The interesting engineering
 | Request hygiene | `lib/nimbus/request.mjs` | Size limits, image allowlist, model allowlist, per-IP rate limiting. The API key never leaves the server |
 | SSRF guard | `lib/nimbus/net.mjs` | Outbound fetches refuse localhost and private/link-local addresses on every redirect hop |
 | Desktop packaging | `electron.js` | A bundled Next.js standalone server bound to loopback only, with links opened in the system browser |
-| Tests | `tests/`, `scripts/` | 119 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
+| Tests | `tests/`, `scripts/` | 161 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
 
 ### Desktop app vs. hosted demo
 
@@ -27,6 +27,7 @@ Nimbus is **desktop-first**. The desktop app runs its own local server, so long-
 
 - **Tool-using agent** — the server runs a model ⇄ tool loop (OpenRouter tool calling) with step, call and time limits. Clear requests are routed straight to the right tool: "job search" runs a job search instead of producing a paragraph about job searching
 - **Live job search** — real openings from Remotive, RemoteOK, Jobicy and Arbeitnow (free, no API keys), filtered by keywords, remote, location and salary floor. Salaries are shown only when the employer listed one; nothing is estimated or invented
+- **Research Mode** — ask a comparison or "which is best" question ("Compare the latest AI coding assistants and determine which offers the best value") and Nimbus runs the `research` tool once: several search angles in parallel, rank fusion, duplicate pages removed (including tracking-parameter variants and copied articles), the best distinct sources read in full (max two per domain), then a **cited report**: direct answer, findings tagged `[n]`, where sources disagree, publication dates, confidence and gaps. Each source carries its **publication date** (from meta tags, JSON-LD, `<time>` or the URL, flagged when stale for a time-sensitive question), a rule-based **credibility estimate** with its reasons (an estimate of how much scrutiny a source deserves, not a fact check) and its most relevant passages. Pages that can't be read fall back to the search snippet and are labelled that way. Every run is saved to a **research history** (questions, sources and the report, never page text) that `research_history` can recall in later chats; "forget everything" clears it too
 - **Live research** — `web_search` (Brave or Tavily if you add a key, otherwise DuckDuckGo) and `fetch_url` to read the pages it cites. Searches support a **time range** (past day/week/month/year), **only these sites** / **exclude these sites**, a **region**, and up to **20 results**. Site filters are enforced on the returned results too, and the result says when a provider couldn't apply a filter
 - **Weather** — `get_weather` returns the current temperature, feels-like, conditions, humidity, wind and a 3-day forecast from [Open-Meteo](https://open-meteo.com/) (free, no key), with the observation time. Weather questions (typos like "tempature" included) go straight to it, because web-search snippets almost never contain the live reading
 - **Files & images** — attach with 📎, paste a screenshot, or drag files onto the message box (up to 5 per message, 10 MB each). Text and code files are read in the browser; PDFs and Word documents are extracted on the server (`/api/extract`, via `unpdf` and `mammoth`); long files are trimmed to 30,000 characters and the reply says so. Images are resized and sent to a vision model; if the selected model can't see images, the free router answers that message with a vision-capable model and a note says so
@@ -44,6 +45,8 @@ Nimbus is **desktop-first**. The desktop app runs its own local server, so long-
 - **Edit & resend** — edit any message you sent and get a fresh reply from that point, like ChatGPT and Claude
 - **Persistent conversations** — chats are auto-titled from your first message and stored locally; search, **rename**, **pin** (pinned chats stay on top) and delete them from the sidebar; newest chats show first. Just start typing on launch: a chat is created automatically, no "New Chat" click needed
 - **Responsive** — collapsible sidebar on desktop, off-canvas drawer with backdrop on mobile
+
+- **Coding workspace (desktop app)** — click **📁 Project**, enter a project folder, and ask about your code ("why is this slow?", "fix the failing test"). Nimbus explores it (`workspace_overview`, `list_files`, `search_code`, `read_file`), cites file and line, and proposes changes with `propose_edit`. **The model can never write a file**: an edit is staged as a diff card, and nothing changes until you press **Apply**. Applied edits are logged and can be **undone** (refused if the file changed again since). To verify, Nimbus can run `npm test`, lint, typecheck or read-only `git` commands, after you confirm each run, and then reads the real output and exit code.
 
 ## Architecture
 
@@ -111,6 +114,7 @@ What happens when something goes wrong:
 | Model sends malformed or invalid tool arguments | Rejected by the schema validator and returned to the model to correct |
 | Model loops on tools | Step, tool-call and wall-clock limits force a final answer with tools disabled; identical repeat calls are served from a per-turn cache |
 | Chosen model is out of credit, gone, down or rate-limited (Smart routing) | Retried, then the next model in the router's chain answers, with a notice. A rejected API key is not retried elsewhere |
+| Research source can't be read, or one search angle fails | The source falls back to its search snippet and is labelled "snippet only"; failed angles are reported and the rest continue. If every search fails the tool errors honestly. Fewer than 3 usable sources marks the research as thin so the report says so |
 | Model reruns near-identical searches, or a tool keeps failing or returning nothing | Reworded repeats (same filters, similar query) are skipped; a tool with 3 failed or empty results is cut off. Either way the tool phase ends and the model must answer with what it has |
 | Model writes a tool call as plain text (`<tool_call>`, `<function=…>`, `[TOOL_CALLS]`, bare JSON) | The markup is filtered out of the stream and the call is recovered and run like a structured one, so raw syntax never reaches the chat |
 | Model returns an empty reply | An honest "couldn't get a reliable answer" message replaces the blank bubble |
@@ -148,7 +152,7 @@ Choices that fit a single-user desktop app, and what I'd change at scale:
 ## Testing
 
 ```bash
-npm test               # 119 automated tests, mocked LLM + mocked HTTP
+npm test               # 161 automated tests, mocked LLM + mocked HTTP
 npm run build && node scripts/smoke-server.mjs   # real built server + mock LLM over HTTP
 npm run eval           # LIVE: real model, real job boards, real web (uses OPENROUTER_KEY)
 npm run metrics        # summarise per-turn metrics logged by the app
@@ -156,8 +160,15 @@ npm run metrics        # summarise per-turn metrics logged by the app
 
 - `npm test` covers intent routing (with an accuracy figure), tool selection and execution, multistep tasks, malformed tool calls, unknown tools, timeouts, API failures, partial provider outages, step and wall-clock limits, duplicate tool calls, no-tool models, confirmation gating, search permissions (ask / allow once / always allow, per group), search filters for each provider, past-chat search, weather, attachments (including injection via attached files), request validation, rate limiting, the model allowlist, syntax highlighting, prompt-injection memory writes, unbacked-claim detection, SSRF and 10 required memory behaviors. Restart persistence is tested in a separate Node process.
 - The smoke test runs the **built** app: NDJSON streaming, cookies, per-user isolation, memory surviving a full server restart, and the memory API (edit, delete, cross-site refusal, secret rejection).
-- `npm run eval` runs 19 live scenarios in eight groups (job, research, chat, memory, sports, date, context, failure). Beyond the per-scenario checks, **every** scenario must also produce a non-empty reply with no raw tool-call syntax and no tool called more than 4 times. Outage scenarios break a tool on purpose and require an honest failure message with no invented links. The sports scenarios are regression cases for the old NFL-scores loop. A full run is diffed against the previous clean full run of the same model and lists any scenario that went from pass to fail. Run one group with `npm run eval -- --only failure`. The checks themselves live in `lib/nimbus/evalchecks.mjs` and are unit-tested.
+- `npm run eval` runs 21 live scenarios in eight groups (job, research, chat, memory, sports, date, context, failure). Beyond the per-scenario checks, **every** scenario must also produce a non-empty reply with no raw tool-call syntax and no tool called more than 4 times. Outage scenarios break a tool on purpose and require an honest failure message with no invented links. The sports scenarios are regression cases for the old NFL-scores loop. A full run is diffed against the previous clean full run of the same model and lists any scenario that went from pass to fail. Run one group with `npm run eval -- --only failure`. The checks themselves live in `lib/nimbus/evalchecks.mjs` and are unit-tested.
 - These tests are **simulated**. Only `npm run eval` proves real end-to-end behavior. It reports task completion, tool-selection accuracy, link grounding (every URL in an answer must come from a tool result), needless clarifying questions and latency, and saves the results to `.nimbus-data/eval/`.
+
+**Coding workspace safeguards** (`lib/nimbus/workspace*.mjs`, `app/api/workspace`):
+- Desktop only: enabled by `NIMBUS_WORKSPACE=1` (set by Electron), never on a hosted deployment.
+- Every path is resolved against the real folder, so `..`, absolute paths and symlinks can't escape it. Folders like drive roots, your whole home folder, system folders, `.ssh` and `AppData` can't be opened.
+- `.env*`, key and certificate files, `.git`, `.npmrc` and credentials files are never read or written; secret-looking strings in other files are redacted before the model sees them, and an edit that would add one is refused. File contents are treated as untrusted data (prompt injection in a README or comment can't direct the agent).
+- Edits are applied only by your click on `/api/workspace` (same-origin, your identity cookie). The server re-checks that the file is byte-identical to what the diff was made from, writes atomically, and keeps the before-text for undo.
+- Commands are an allowlist (`npm test`, `npm run test|lint|build|typecheck|check` if the script exists, `node --test`, `npx eslint|tsc|prettier --check|vitest run|jest`, `pytest`, `go test`, `cargo test`, `git status|diff|log`). No shell is used, so pipes, redirects and `&&` are rejected; path arguments must stay inside the project. They run with a stripped environment (none of Nimbus's API keys), a 60 s timeout and capped output, and each run needs your confirmation. Note: running tests runs *your project's own code*.
 
 ## Configuration
 
@@ -168,6 +179,7 @@ npm run metrics        # summarise per-turn metrics logged by the app
 | `NIMBUS_EMBEDDINGS_MODEL` | Optional. OpenRouter embedding model id for semantic memory recall (sends memory text to that provider) |
 | `NIMBUS_SMART_FREE_ONLY=1` | Optional. Keeps the **Smart** router on free models |
 | `NIMBUS_DATA_DIR` | Where memory and metrics are stored. Default `./.nimbus-data`. Electron uses the app's user-data folder |
+| `NIMBUS_WORKSPACE=1` | Enables the coding workspace (the desktop app sets this). Leave unset on any hosted deployment |
 | `NIMBUS_METRICS=off` | Disable per-turn metrics logging. Metrics never include message content |
 
 ## Tech Stack

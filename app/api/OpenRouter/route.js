@@ -4,7 +4,10 @@ import { describeRequest, routeTask } from "@/lib/nimbus/router.mjs";
 import { runAgent } from "@/lib/nimbus/agent.mjs";
 import { createOpenRouterClient } from "@/lib/nimbus/llm.mjs";
 import { resolveIdentity } from "@/lib/nimbus/identity.mjs";
-import { getStore, logMetrics } from "@/lib/nimbus/server.mjs";
+import { getStore, getResearchStore, getWorkspaceStore, workspaceEnabled, logMetrics } from "@/lib/nimbus/server.mjs";
+import { DEFAULT_TOOLS } from "@/lib/nimbus/tools/index.mjs";
+import { WORKSPACE_TOOLS } from "@/lib/nimbus/tools/workspace.mjs";
+import path from "node:path";
 import { normalizePermissions } from "@/lib/nimbus/permissions.mjs";
 
 // fs-backed memory + DNS checks need the Node runtime.
@@ -44,11 +47,20 @@ export async function POST(req) {
     const validationError = validateMessages(messages);
     if (validationError) return jsonError(validationError, 400, setCookie);
 
+    // Coding workspace: only on the desktop app, only when the user opened a folder.
+    let workspace = null;
+    let workspaceInfo = null;
+    if (workspaceEnabled()) {
+      workspace = getWorkspaceStore();
+      const root = await workspace.getRoot(userKey).catch(() => null);
+      if (root) workspaceInfo = { name: path.basename(root) };
+    }
+
     // "Smart" picks a concrete model for this request and a chain to fall back on.
     let routing = null;
     let requestedModel = model;
     if (MODELS[model]?.router) {
-      routing = routeTask(describeRequest(messages), MODELS, { allowPaid: process.env.NIMBUS_SMART_FREE_ONLY !== "1" });
+      routing = routeTask(describeRequest(messages), MODELS, { allowPaid: process.env.NIMBUS_SMART_FREE_ONLY !== "1", forceTask: workspaceInfo ? "code" : null });
       requestedModel = routing.chain[0];
     }
     const { modelSlug, visionNotice, supportsTools } = chooseModel({ requested: requestedModel, messages, models: MODELS, visionModel: VISION_MODEL });
@@ -80,6 +92,8 @@ export async function POST(req) {
             model: upstreamModel,
             userKey,
             store: getStore(),
+            researchStore: getResearchStore(),
+            ...(workspaceInfo ? { tools: [...DEFAULT_TOOLS, ...WORKSPACE_TOOLS], workspace, workspaceInfo } : {}),
             llm,
             emit,
             signal: req.signal,

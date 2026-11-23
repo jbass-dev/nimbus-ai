@@ -81,6 +81,8 @@ function startStandaloneServer(port) {
       // API (and the OpenRouter key behind it) to everyone on the same network.
       HOSTNAME: "127.0.0.1",
       NODE_ENV: "production",
+      // The coding workspace (read project files, stage edits) is a desktop-only feature.
+      NIMBUS_WORKSPACE: "1",
       // Persistent memory must live in a writable per-user location, not in
       // the (possibly read-only) install directory, and must survive updates.
       NIMBUS_DATA_DIR: process.env.NIMBUS_DATA_DIR || path.join(app.getPath("userData"), "nimbus-data"),

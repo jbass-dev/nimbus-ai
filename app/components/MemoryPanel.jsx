@@ -8,6 +8,7 @@ const CATEGORY_LABELS = {
   project: "Projects",
   decision: "Decisions",
   task: "Open tasks",
+  conversation: "From past chats",
   other: "Other",
 };
 
