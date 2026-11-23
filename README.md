@@ -17,7 +17,7 @@ Nimbus is not a chat UI wrapped around one API call. The interesting engineering
 | Request hygiene | `lib/nimbus/request.mjs` | Size limits, image allowlist, model allowlist, per-IP rate limiting. The API key never leaves the server |
 | SSRF guard | `lib/nimbus/net.mjs` | Outbound fetches refuse localhost and private/link-local addresses on every redirect hop |
 | Desktop packaging | `electron.js` | A bundled Next.js standalone server bound to loopback only, with links opened in the system browser |
-| Tests | `tests/`, `scripts/` | 165 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
+| Tests | `tests/`, `scripts/` | 174 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
 
 ### Desktop app vs. hosted demo
 
@@ -47,6 +47,7 @@ Nimbus is **desktop-first**. The desktop app runs its own local server, so long-
 - **Responsive** — collapsible sidebar on desktop, off-canvas drawer with backdrop on mobile
 
 - **Coding workspace (desktop app)** — click **📁 Project**, enter a project folder, and ask about your code ("why is this slow?", "fix the failing test"). Nimbus explores it (`workspace_overview`, `list_files`, `search_code`, `read_file`), cites file and line, and proposes changes with `propose_edit`. **The model can never write a file**: an edit is staged as a diff card, and nothing changes until you press **Apply**. Applied edits are logged and can be **undone** (refused if the file changed again since). To verify, Nimbus can run `npm test`, lint, typecheck or read-only `git` commands, after you confirm each run, and then reads the real output and exit code.
+- **Background tasks (desktop app)** — "check for new remote React jobs every morning" in chat (you confirm), or add one under **⏰ Tasks**. Schedules: `every 30m` (minimum), `every 6h`, `daily 08:30`, `weekdays 07:45` in your local time. Nimbus runs them itself while the app is open (it keeps running in the tray), writes a short cited report that says what changed since the last run, and notifies you. Up to 10 tasks; **Run now**, pause, delete; a task that fails three times in a row pauses itself. Background runs are deliberately limited: web, job-board and weather lookups only, so no memory writes, no chat or file access, nothing that needs a confirmation, and a hijacked page can't do anything beyond changing the text of a report. A heartbeat started in `instrumentation.js` pings an internal endpoint every minute (secret per server process); `lib/nimbus/background.mjs` runs what's due, one at a time. They run on your free-model quota; set `NIMBUS_BACKGROUND_MODEL` to a model slug from `app/config/models.js` to change that.
 
 ## Architecture
 
@@ -152,7 +153,7 @@ Choices that fit a single-user desktop app, and what I'd change at scale:
 ## Testing
 
 ```bash
-npm test               # 165 automated tests, mocked LLM + mocked HTTP
+npm test               # 174 automated tests, mocked LLM + mocked HTTP
 npm run build && node scripts/smoke-server.mjs   # real built server + mock LLM over HTTP
 npm run eval           # LIVE: real model, real job boards, real web (uses OPENROUTER_KEY)
 npm run metrics        # summarise per-turn metrics logged by the app
@@ -179,6 +180,8 @@ npm run metrics        # summarise per-turn metrics logged by the app
 | `NIMBUS_EMBEDDINGS_MODEL` | Optional. OpenRouter embedding model id for semantic memory recall (sends memory text to that provider) |
 | `NIMBUS_SMART_FREE_ONLY=1` | Optional. Keeps the **Smart** router on free models |
 | `NIMBUS_DATA_DIR` | Where memory and metrics are stored. Default `./.nimbus-data`. Electron uses the app's user-data folder |
+| `NIMBUS_BACKGROUND=1` | Enables scheduled background tasks (the desktop app sets this). Leave unset on a hosted deployment |
+| `NIMBUS_BACKGROUND_MODEL` | Optional. Model slug for background runs. Default `free-router` |
 | `NIMBUS_WORKSPACE=1` | Enables the coding workspace (the desktop app sets this). Leave unset on any hosted deployment |
 | `NIMBUS_METRICS=off` | Disable per-turn metrics logging. Metrics never include message content |
 
@@ -217,6 +220,6 @@ npm run electron        # dev: launches Electron against `next dev`
 npm run electron:dist   # prod: builds Next.js + packages with electron-builder
 ```
 
-Desktop extras: a **global shortcut** (Ctrl/Cmd+Shift+Space) shows or hides Nimbus from anywhere, a **tray icon** (Show, New Chat, Quit; closing the window hides to the tray on Windows/Linux), an **app menu** (New Chat Ctrl+N, Export Chat, Open Project Folder), a **Browse…** folder picker for the coding workspace, **Export chat** to a Markdown file (including staged diffs), and window size/position remembered between launches (ignored if that monitor is gone). The page talks to Electron only through `preload.js`, which exposes four fixed functions (no Node access), and the main process ignores them unless they come from the local Nimbus server (`desktop-helpers.js`).
+Desktop extras: a **global shortcut** (Ctrl/Cmd+Shift+Space) shows or hides Nimbus from anywhere, a **tray icon** (Show, New Chat, Quit; closing the window hides to the tray on Windows/Linux), an **app menu** (New Chat Ctrl+N, Export Chat, Open Project Folder), a **Browse…** folder picker for the coding workspace, **Export chat** to a Markdown file (including staged diffs), and window size/position remembered between launches (ignored if that monitor is gone). A tray toggle **Start at login** (off by default; starts hidden in the tray). **Auto-update** (packaged builds): Nimbus checks GitHub Releases for `jbass-dev/ai-chat-interface` shortly after launch and every 6 hours, downloads in the background, asks before restarting, and otherwise installs when you next quit. To publish a release: bump `version` in `package.json`, set `GH_TOKEN` (a GitHub token with repo access) and run `npm run electron:release`; it uploads the installer and `latest.yml` to a draft release, which you then publish. Updates need a public repo (or a token baked into the app, which we don't do). Unsigned Windows installers update fine but show a SmartScreen warning; set `NIMBUS_NO_UPDATE=1` to disable checks. The page talks to Electron only through `preload.js`, which exposes four fixed functions (no Node access), and the main process ignores them unless they come from the local Nimbus server (`desktop-helpers.js`).
 
 The desktop app adds a native right-click menu: **Copy**, **Share** and **Select All** on selected text; **Undo**, **Cut**, **Copy**, **Paste** and **Select All** in the message box; **Open Link in Browser** and **Copy Link** on links. Share uses the native share sheet on macOS; on Windows and Linux it offers **Email…** and **Search the web**, since Electron has no native share sheet there.

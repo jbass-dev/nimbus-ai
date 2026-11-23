@@ -138,23 +138,80 @@ function buildAppMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+function refreshTrayMenu() {
+  if (!tray) return;
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: "Show Nimbus", click: showWindow },
+      { label: "New Chat", click: () => sendToApp("nimbus:new-chat") },
+      { type: "separator" },
+      ...(app.isPackaged && process.platform !== "linux"
+        ? [{ label: "Start at login", type: "checkbox", checked: loginEnabled(), click: (item) => setLogin(item.checked) }]
+        : []),
+      ...(updateReady ? [{ label: `Update ready (${updateReady}): restart to install`, click: () => { quitting = true; require("electron-updater").autoUpdater.quitAndInstall(); } }] : []),
+      { type: "separator" },
+      { label: `Nimbus v${app.getVersion()}`, enabled: false },
+      { label: "Quit Nimbus", click: () => { quitting = true; app.quit(); } },
+    ])
+  );
+}
+
 function createTray() {
   try {
     const icon = nativeImage.createFromPath(path.join(__dirname, "tray-icon.png")).resize({ width: 16, height: 16 });
     tray = new Tray(icon);
     tray.setToolTip("Nimbus");
-    tray.setContextMenu(
-      Menu.buildFromTemplate([
-        { label: "Show Nimbus", click: showWindow },
-        { label: "New Chat", click: () => sendToApp("nimbus:new-chat") },
-        { type: "separator" },
-        { label: "Quit Nimbus", click: () => { quitting = true; app.quit(); } },
-      ])
-    );
+    refreshTrayMenu();
     tray.on("click", showWindow);
   } catch (err) {
     console.error("Tray unavailable:", err.message);
   }
+}
+
+/* ---- start at login (off unless the user turns it on; packaged builds only) ---- */
+const startedHidden = process.argv.includes("--hidden");
+function loginEnabled() {
+  return app.isPackaged && app.getLoginItemSettings({ args: ["--hidden"] }).openAtLogin;
+}
+function setLogin(enabled) {
+  if (!app.isPackaged) return;
+  // Windows/macOS only; Linux ignores this.
+  app.setLoginItemSettings({ openAtLogin: enabled, args: ["--hidden"] });
+  refreshTrayMenu();
+}
+
+/* ---- updates: GitHub Releases via electron-updater (packaged builds only) ---- */
+let updateReady = null; // version string once downloaded
+function setupAutoUpdate() {
+  if (!app.isPackaged || process.env.NIMBUS_NO_UPDATE === "1") return;
+  let autoUpdater;
+  try {
+    ({ autoUpdater } = require("electron-updater"));
+  } catch (err) {
+    console.warn("Auto-update unavailable:", err.message);
+    return;
+  }
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true; // never interrupts: installs when you next quit
+  autoUpdater.on("error", (err) => console.warn("Update check failed:", err?.message));
+  autoUpdater.on("update-downloaded", async (info) => {
+    updateReady = info.version;
+    refreshTrayMenu();
+    const r = await dialog.showMessageBox(win ?? undefined, {
+      type: "info",
+      buttons: ["Restart now", "Later"],
+      defaultId: 1,
+      message: `Nimbus ${info.version} is ready`,
+      detail: "Restart to finish updating. Otherwise it installs the next time you quit Nimbus.",
+    });
+    if (r.response === 0) {
+      quitting = true;
+      autoUpdater.quitAndInstall();
+    }
+  });
+  const check = () => autoUpdater.checkForUpdates().catch(() => {});
+  setTimeout(check, 15_000);
+  setInterval(check, 6 * 60 * 60 * 1000).unref?.();
 }
 
 function registerShortcut() {
@@ -200,6 +257,8 @@ function startStandaloneServer(port) {
       NODE_ENV: "production",
       // The coding workspace (read project files, stage edits) is a desktop-only feature.
       NIMBUS_WORKSPACE: "1",
+      // Scheduled background tasks run while Nimbus sits in the tray.
+      NIMBUS_BACKGROUND: "1",
       // Persistent memory must live in a writable per-user location, not in
       // the (possibly read-only) install directory, and must survive updates.
       NIMBUS_DATA_DIR: process.env.NIMBUS_DATA_DIR || path.join(app.getPath("userData"), "nimbus-data"),
@@ -297,10 +356,12 @@ async function createWindow() {
   const saved = loadWindowState();
   win = new BrowserWindow({
     width: 1200, height: 800, ...(saved.bounds ?? {}), minWidth: 600, minHeight: 400,
+    show: !(startedHidden && tray),
     title: `Nimbus ${app.getVersion()}`,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   if (saved.maximized) win.maximize();
+  // Launched by the login item: wait quietly in the tray (only if there is one to bring it back from).
   win.on("close", () => saveWindowState(win));
   // Closing the window hides Nimbus to the tray (when there is one) so the shortcut can bring it back instantly.
   win.on("close", (event) => {
@@ -359,6 +420,7 @@ if (!gotLock) {
     buildAppMenu();
     createTray();
     registerShortcut();
+    setupAutoUpdate();
     return createWindow();
   });
 

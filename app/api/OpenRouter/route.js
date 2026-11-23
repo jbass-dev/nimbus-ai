@@ -4,9 +4,10 @@ import { describeRequest, routeTask } from "@/lib/nimbus/router.mjs";
 import { runAgent } from "@/lib/nimbus/agent.mjs";
 import { createOpenRouterClient } from "@/lib/nimbus/llm.mjs";
 import { resolveIdentity } from "@/lib/nimbus/identity.mjs";
-import { getStore, getResearchStore, getWorkspaceStore, workspaceEnabled, logMetrics } from "@/lib/nimbus/server.mjs";
+import { getStore, getResearchStore, getWorkspaceStore, workspaceEnabled, getTaskStore, backgroundEnabled, logMetrics } from "@/lib/nimbus/server.mjs";
 import { DEFAULT_TOOLS } from "@/lib/nimbus/tools/index.mjs";
 import { WORKSPACE_TOOLS } from "@/lib/nimbus/tools/workspace.mjs";
+import { TASK_TOOLS } from "@/lib/nimbus/tools/tasks.mjs";
 import path from "node:path";
 import { normalizePermissions } from "@/lib/nimbus/permissions.mjs";
 
@@ -93,7 +94,9 @@ export async function POST(req) {
             userKey,
             store: getStore(),
             researchStore: getResearchStore(),
-            ...(workspaceInfo ? { tools: [...DEFAULT_TOOLS, ...WORKSPACE_TOOLS], workspace, workspaceInfo } : {}),
+            tools: [...DEFAULT_TOOLS, ...(workspaceInfo ? WORKSPACE_TOOLS : []), ...(backgroundEnabled() ? TASK_TOOLS : [])],
+            ...(workspaceInfo ? { workspace, workspaceInfo } : {}),
+            ...(backgroundEnabled() ? { taskStore: getTaskStore() } : {}),
             llm,
             emit,
             signal: req.signal,

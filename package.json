@@ -12,9 +12,11 @@
     "eval": "node --env-file=.env.local scripts/eval-live.mjs",
     "metrics": "node scripts/metrics-report.mjs",
     "electron": "electron .",
-    "electron:dist": "next build && electron-builder"
+    "electron:dist": "next build && electron-builder",
+    "electron:release": "next build && electron-builder --publish always"
   },
   "dependencies": {
+    "electron-updater": "^6.8.11",
     "mammoth": "1.13.0",
     "next": "16.2.4",
     "react": "19.2.4",
@@ -38,6 +40,7 @@
     "productName": "Nimbus",
     "files": ["electron.js", "preload.js", "desktop-helpers.js", "tray-icon.png", "package.json"],
     "afterPack": "scripts/afterPack.js",
+    "publish": [{ "provider": "github", "owner": "jbass-dev", "repo": "ai-chat-interface" }],
     "extraResources": [
       {
         "from": ".next/standalone",

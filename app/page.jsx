@@ -9,6 +9,7 @@ import AttachmentChips from "./components/AttachmentChips";
 import { ACCEPT, MAX_ATTACHMENTS, readAttachment, toRequestMessage } from "@/lib/ui/attachments.mjs";
 import MemoryPanel from "./components/MemoryPanel";
 import WorkspacePanel from "./components/WorkspacePanel";
+import TasksPanel from "./components/TasksPanel";
 import { chatToMarkdown } from "@/lib/ui/export.mjs";
 import { MODELS, DEFAULT_MODEL } from "./config/models";
 
@@ -32,6 +33,30 @@ export default function Home() {
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [workspace, setWorkspace] = useState(null);
   const [isDesktop, setIsDesktop] = useState(false);
+  const [showTasks, setShowTasks] = useState(false);
+  const [taskInfo, setTaskInfo] = useState({ enabled: false, tasks: [], unread: 0 });
+  const lastUnread = useRef(0);
+  // Background tasks (desktop only): poll for new results and raise a notification when one arrives.
+  const refreshTasks = useCallback(async () => {
+    try {
+      const info = await fetch("/api/tasks", { cache: "no-store" }).then((r) => r.json());
+      setTaskInfo(info.enabled ? info : { enabled: false, tasks: [], unread: 0 });
+      if (info.enabled && info.unread > lastUnread.current && typeof Notification !== "undefined") {
+        const fresh = info.tasks.find((t) => t.unread);
+        const show = () => new Notification(fresh?.title ?? "Nimbus", { body: "A background task has new results." });
+        if (Notification.permission === "granted") show();
+        else if (Notification.permission !== "denied") Notification.requestPermission().then((p) => p === "granted" && show());
+      }
+      lastUnread.current = info.enabled ? info.unread : 0;
+    } catch {
+      // offline or server restarting: try again on the next beat
+    }
+  }, []);
+  useEffect(() => {
+    refreshTasks();
+    const timer = setInterval(refreshTasks, 60_000);
+    return () => clearInterval(timer);
+  }, [refreshTasks]);
   const exportChatRef = useRef(() => {});
   const createChatRef = useRef(() => {});
   // Hidden unless the server says the coding workspace is on (desktop app only).
@@ -705,6 +730,16 @@ export default function Home() {
               ⬇ Export
             </button>
           )}
+          {taskInfo.enabled && (
+            <button
+              type="button"
+              onClick={() => { setShowTasks(true); refreshTasks(); }}
+              className="px-3 py-1.5 rounded-lg border border-neutral-700 text-sm text-neutral-300 hover:text-white hover:border-indigo-500 transition-colors"
+              title="Things Nimbus checks for you on a schedule"
+            >
+              ⏰ Tasks{taskInfo.unread > 0 ? ` (${taskInfo.unread})` : ""}
+            </button>
+          )}
           {workspace?.enabled && (
             <button
               type="button"
@@ -748,6 +783,7 @@ export default function Home() {
         </header>
 
         {showMemory && <MemoryPanel onClose={() => setShowMemory(false)} />}
+        {showTasks && <TasksPanel tasks={taskInfo.tasks} onClose={() => setShowTasks(false)} onRefresh={refreshTasks} />}
         {showWorkspace && <WorkspacePanel onClose={() => setShowWorkspace(false)} onChange={setWorkspace} />}
         {showPermissions && (
           <PermissionsPanel
