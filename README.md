@@ -17,7 +17,7 @@ Nimbus is not a chat UI wrapped around one API call. The interesting engineering
 | Request hygiene | `lib/nimbus/request.mjs` | Size limits, image allowlist, model allowlist, per-IP rate limiting. The API key never leaves the server |
 | SSRF guard | `lib/nimbus/net.mjs` | Outbound fetches refuse localhost and private/link-local addresses on every redirect hop |
 | Desktop packaging | `electron.js` | A bundled Next.js standalone server bound to loopback only, with links opened in the system browser |
-| Tests | `tests/`, `scripts/` | 161 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
+| Tests | `tests/`, `scripts/` | 165 unit tests (mocked LLM and HTTP), a smoke test against the built server, and a live eval against real models |
 
 ### Desktop app vs. hosted demo
 
@@ -152,7 +152,7 @@ Choices that fit a single-user desktop app, and what I'd change at scale:
 ## Testing
 
 ```bash
-npm test               # 161 automated tests, mocked LLM + mocked HTTP
+npm test               # 165 automated tests, mocked LLM + mocked HTTP
 npm run build && node scripts/smoke-server.mjs   # real built server + mock LLM over HTTP
 npm run eval           # LIVE: real model, real job boards, real web (uses OPENROUTER_KEY)
 npm run metrics        # summarise per-turn metrics logged by the app
@@ -216,5 +216,7 @@ Open [http://localhost:3000](http://localhost:3000).
 npm run electron        # dev: launches Electron against `next dev`
 npm run electron:dist   # prod: builds Next.js + packages with electron-builder
 ```
+
+Desktop extras: a **global shortcut** (Ctrl/Cmd+Shift+Space) shows or hides Nimbus from anywhere, a **tray icon** (Show, New Chat, Quit; closing the window hides to the tray on Windows/Linux), an **app menu** (New Chat Ctrl+N, Export Chat, Open Project Folder), a **Browse…** folder picker for the coding workspace, **Export chat** to a Markdown file (including staged diffs), and window size/position remembered between launches (ignored if that monitor is gone). The page talks to Electron only through `preload.js`, which exposes four fixed functions (no Node access), and the main process ignores them unless they come from the local Nimbus server (`desktop-helpers.js`).
 
 The desktop app adds a native right-click menu: **Copy**, **Share** and **Select All** on selected text; **Undo**, **Cut**, **Copy**, **Paste** and **Select All** in the message box; **Open Link in Browser** and **Copy Link** on links. Share uses the native share sheet on macOS; on Windows and Linux it offers **Email…** and **Search the web**, since Electron has no native share sheet there.

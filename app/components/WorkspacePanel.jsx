@@ -14,6 +14,11 @@ export default function WorkspacePanel({ onClose, onChange }) {
   const [path, setPath] = useState("");
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const canBrowse = typeof window !== "undefined" && typeof window.nimbusDesktop?.pickFolder === "function";
+  const browse = async () => {
+    const picked = await window.nimbusDesktop.pickFolder().catch(() => null);
+    if (picked) setPath(picked);
+  };
 
   const refresh = useCallback(() => api("GET").then((s) => { setState(s); onChange?.(s); setError(null); }).catch((e) => setError(e.message)), [onChange]);
   useEffect(() => { refresh(); }, [refresh]);
@@ -42,6 +47,7 @@ export default function WorkspacePanel({ onClose, onChange }) {
             )}
             <form onSubmit={(e) => { e.preventDefault(); if (path.trim()) act({ action: "set_root", path }); }} className="flex gap-2">
               <input value={path} onChange={(e) => setPath(e.target.value)} placeholder="C:\Dev\my-project" className="min-w-0 flex-1 rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 font-mono text-xs outline-none focus:border-indigo-500" aria-label="Full path to your project folder" />
+              {canBrowse && <button type="button" onClick={browse} className="rounded-lg border border-neutral-600 px-3 py-2 hover:bg-white/10">Browse…</button>}
               <button type="submit" disabled={busy || !path.trim()} className="rounded-lg bg-indigo-500 px-3 py-2 font-medium text-white hover:bg-indigo-400 disabled:opacity-50">{state.root ? "Switch" : "Open"}</button>
             </form>
             {state.changes?.length > 0 && (

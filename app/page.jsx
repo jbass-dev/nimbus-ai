@@ -9,6 +9,7 @@ import AttachmentChips from "./components/AttachmentChips";
 import { ACCEPT, MAX_ATTACHMENTS, readAttachment, toRequestMessage } from "@/lib/ui/attachments.mjs";
 import MemoryPanel from "./components/MemoryPanel";
 import WorkspacePanel from "./components/WorkspacePanel";
+import { chatToMarkdown } from "@/lib/ui/export.mjs";
 import { MODELS, DEFAULT_MODEL } from "./config/models";
 
 const MAX_INPUT_LENGTH = 8000;
@@ -30,6 +31,9 @@ export default function Home() {
   const [showMemory, setShowMemory] = useState(false);
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [workspace, setWorkspace] = useState(null);
+  const [isDesktop, setIsDesktop] = useState(false);
+  const exportChatRef = useRef(() => {});
+  const createChatRef = useRef(() => {});
   // Hidden unless the server says the coding workspace is on (desktop app only).
   useEffect(() => {
     fetch("/api/workspace").then((r) => r.json()).then(setWorkspace).catch(() => setWorkspace({ enabled: false }));
@@ -152,6 +156,11 @@ export default function Home() {
   const activeChat =
     chatSessions.find((chat) => chat.id === activeChatId) ?? null;
 
+  exportChatRef.current = async () => {
+    if (!activeChat?.messages?.length || !window.nimbusDesktop) return;
+    await window.nimbusDesktop.saveTextFile(activeChat.title, chatToMarkdown(activeChat));
+  };
+
   const updateChatMessages = useCallback((chatId, updater) => {
     setChatSessions((prev) =>
       prev.map((chat) => {
@@ -195,6 +204,7 @@ export default function Home() {
 
     return id;
   }, []);
+  createChatRef.current = createChat;
 
   const patchLastAssistant = useCallback(
     (chatId, patch) => {
@@ -482,6 +492,19 @@ export default function Home() {
     streamCompletion(activeChat.id, messages);
   }, [activeChat, isStreaming, streamCompletion]);
 
+  // Desktop app only: menu, tray and shortcut actions arrive through the preload bridge.
+  useEffect(() => {
+    const d = typeof window !== "undefined" ? window.nimbusDesktop : null;
+    if (!d) return undefined;
+    setIsDesktop(true);
+    const offNew = d.onNewChat(() => createChatRef.current());
+    const offMenu = d.onMenu((action) => {
+      if (action === "export-chat") exportChatRef.current();
+      if (action === "open-project") setShowWorkspace(true);
+    });
+    return () => { offNew?.(); offMenu?.(); };
+  }, []);
+
   const confirmAction = useCallback(
     (actionId) => {
       if (!activeChat || isStreaming) return;
@@ -672,6 +695,16 @@ export default function Home() {
           </div>
 
           <div className="flex items-center gap-2">
+          {isDesktop && activeChat?.messages?.length > 0 && (
+            <button
+              type="button"
+              onClick={() => exportChatRef.current()}
+              className="px-3 py-1.5 rounded-lg border border-neutral-700 text-sm text-neutral-300 hover:text-white hover:border-indigo-500 transition-colors"
+              title="Save this chat as a Markdown file"
+            >
+              ⬇ Export
+            </button>
+          )}
           {workspace?.enabled && (
             <button
               type="button"

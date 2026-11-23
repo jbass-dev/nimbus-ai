@@ -1,5 +1,7 @@
-const { app, BrowserWindow, Menu, shell, clipboard, dialog } = require("electron");
+const { app, BrowserWindow, Menu, Tray, shell, clipboard, dialog, globalShortcut, ipcMain, nativeImage, screen } = require("electron");
+const fs = require("fs");
 const path = require("path");
+const { safeFileName, usableBounds, isAppUrl } = require("./desktop-helpers");
 const { spawn, execFileSync } = require("child_process");
 const http = require("http");
 const net = require("net");
@@ -44,6 +46,121 @@ function stopStaleNimbusServer(port) {
   }
 }
 let win = null;
+let tray = null;
+let quitting = false;
+const SHORTCUT = "CommandOrControl+Shift+Space";
+
+/* ---- window position/size is remembered between launches ---- */
+const stateFile = () => path.join(app.getPath("userData"), "window-state.json");
+function loadWindowState() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(stateFile(), "utf8"));
+    return { bounds: usableBounds(saved, screen.getAllDisplays()), maximized: saved.maximized === true };
+  } catch {
+    return { bounds: null, maximized: false };
+  }
+}
+function saveWindowState(window) {
+  try {
+    const maximized = window.isMaximized();
+    const bounds = maximized ? (window.getNormalBounds?.() ?? window.getBounds()) : window.getBounds();
+    fs.writeFileSync(stateFile(), JSON.stringify({ ...bounds, maximized }));
+  } catch {
+    // Not worth interrupting the user for.
+  }
+}
+
+function showWindow() {
+  if (!win) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+function toggleWindow() {
+  if (win && win.isVisible() && win.isFocused()) win.hide();
+  else showWindow();
+}
+function sendToApp(channel, ...args) {
+  showWindow();
+  win?.webContents.send(channel, ...args);
+}
+
+/* Only pages served by the local Nimbus server may use the desktop bridge. */
+function fromApp(event) {
+  return isAppUrl(event.senderFrame?.url ?? event.sender.getURL(), PORT);
+}
+
+function registerIpc() {
+  ipcMain.handle("nimbus:pick-folder", async (event) => {
+    if (!fromApp(event)) return null;
+    const r = await dialog.showOpenDialog(win, { title: "Open a project folder", properties: ["openDirectory"] });
+    return r.canceled ? null : (r.filePaths[0] ?? null);
+  });
+  ipcMain.handle("nimbus:save-text", async (event, defaultName, text) => {
+    if (!fromApp(event) || typeof text !== "string" || text.length > 5_000_000) return { ok: false };
+    const base = safeFileName(defaultName);
+    const r = await dialog.showSaveDialog(win, {
+      title: "Export chat",
+      defaultPath: path.join(app.getPath("documents"), `${base}.md`),
+      filters: [{ name: "Markdown", extensions: ["md"] }, { name: "Text", extensions: ["txt"] }],
+    });
+    if (r.canceled || !r.filePath) return { ok: false, canceled: true };
+    try {
+      fs.writeFileSync(r.filePath, text, "utf8");
+      return { ok: true, path: r.filePath };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+}
+
+function buildAppMenu() {
+  const mac = process.platform === "darwin";
+  const template = [
+    ...(mac ? [{ role: "appMenu" }] : []),
+    {
+      label: "File",
+      submenu: [
+        { label: "New Chat", accelerator: "CommandOrControl+N", click: () => sendToApp("nimbus:new-chat") },
+        { label: "Export Chat…", accelerator: "CommandOrControl+Shift+E", click: () => sendToApp("nimbus:menu", "export-chat") },
+        { label: "Open Project Folder…", accelerator: "CommandOrControl+Shift+O", click: () => sendToApp("nimbus:menu", "open-project") },
+        { type: "separator" },
+        mac ? { role: "close" } : { role: "quit" },
+      ],
+    },
+    { role: "editMenu" },
+    {
+      label: "View",
+      submenu: [{ role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }, ...(app.isPackaged ? [] : [{ role: "toggleDevTools" }])],
+    },
+    { role: "windowMenu" },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+function createTray() {
+  try {
+    const icon = nativeImage.createFromPath(path.join(__dirname, "tray-icon.png")).resize({ width: 16, height: 16 });
+    tray = new Tray(icon);
+    tray.setToolTip("Nimbus");
+    tray.setContextMenu(
+      Menu.buildFromTemplate([
+        { label: "Show Nimbus", click: showWindow },
+        { label: "New Chat", click: () => sendToApp("nimbus:new-chat") },
+        { type: "separator" },
+        { label: "Quit Nimbus", click: () => { quitting = true; app.quit(); } },
+      ])
+    );
+    tray.on("click", showWindow);
+  } catch (err) {
+    console.error("Tray unavailable:", err.message);
+  }
+}
+
+function registerShortcut() {
+  // Another program may already own the shortcut; that's fine, Nimbus just works without it.
+  if (!globalShortcut.register(SHORTCUT, toggleWindow)) console.warn(`Could not register ${SHORTCUT}`);
+}
 
 // Probe 127.0.0.1 directly: "localhost" can resolve to ::1 first, and the
 // server only listens on IPv4 loopback.
@@ -177,7 +294,21 @@ function attachContextMenu(window) {
 async function createWindow() {
   const isDev = !app.isPackaged;
 
-  win = new BrowserWindow({ width: 1200, height: 800, title: `Nimbus ${app.getVersion()}` });
+  const saved = loadWindowState();
+  win = new BrowserWindow({
+    width: 1200, height: 800, ...(saved.bounds ?? {}), minWidth: 600, minHeight: 400,
+    title: `Nimbus ${app.getVersion()}`,
+    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  if (saved.maximized) win.maximize();
+  win.on("close", () => saveWindowState(win));
+  // Closing the window hides Nimbus to the tray (when there is one) so the shortcut can bring it back instantly.
+  win.on("close", (event) => {
+    if (!quitting && tray && process.platform !== "darwin") {
+      event.preventDefault();
+      win.hide();
+    }
+  });
   attachContextMenu(win);
   lockNavigation(win, `http://localhost:${PORT}`);
   // Keep the version in the title bar so it's obvious which build is running.
@@ -221,14 +352,15 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
-    }
-  });
+  app.on("second-instance", showWindow);
 
-  app.whenReady().then(createWindow);
+  app.whenReady().then(() => {
+    registerIpc();
+    buildAppMenu();
+    createTray();
+    registerShortcut();
+    return createWindow();
+  });
 
   app.on("window-all-closed", () => {
     if (process.platform !== "darwin") app.quit();
@@ -249,5 +381,6 @@ function stopServer() {
   }
 }
 
-app.on("before-quit", stopServer);
+app.on("before-quit", () => { quitting = true; stopServer(); });
+app.on("will-quit", () => globalShortcut.unregisterAll());
 process.on("exit", stopServer);
